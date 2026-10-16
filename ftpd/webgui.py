@@ -435,10 +435,17 @@ def build_page(console: WebConsole) -> None:
         with ui.tab_panel(tab_service):
             with ui.card().classes("w-full"):
                 ui.label("服务设置").classes("text-base font-semibold")
-                ui.label(
-                    "FTP 与 Web 控制台共用同一个端口：浏览器用 http、"
-                    "FTP 客户端用 ftp，端口上的协议由首包自动区分。"
-                ).classes("text-xs opacity-70")
+                if console.shared_port:
+                    hint = (
+                        "FTP 与 Web 控制台共用一个端口，协议由首包自动区分；"
+                        "代价是 FTP 连接要多等一小会儿用于判定。"
+                    )
+                else:
+                    hint = (
+                        "FTP 与 Web 控制台各占一个端口：FTP 端口不做协议判定，"
+                        "控制台端口只跑 HTTP/HTTPS。"
+                    )
+                ui.label(hint).classes("text-xs opacity-70")
 
                 directory_input = ui.input(
                     "共享目录（FTP 用户看到的根目录）",
