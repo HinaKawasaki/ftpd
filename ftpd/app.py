@@ -2,29 +2,34 @@
 
 启动顺序：
 
-1. 先把 NiceGUI/uvicorn 起在**回环地址**的一个内部端口上；
-2. 再用 :class:`ftpd.server.FTPService` 占用**共享端口**，
-   并把内部 Web 端口告诉它 —— 端口上的协议复用由它负责；
-3. 主线程只负责等待 Ctrl+C。
+1. 需要的话先生成一张自签证书（FTPS 与控制台 HTTPS 共用）；
+2. 把 NiceGUI/uvicorn 起在**回环地址**上 —— 明文一个、HTTPS 一个，
+   两者共用一个 FastAPI 应用对象；
+3. 再用 :class:`ftpd.server.FTPService` 占用**共享端口**，
+   并把两个内部端口告诉它：端口上的协议复用由它负责
+   （TLS 连接走 HTTPS 后端，明文 HTTP 走另一个）；
+4. 主线程只负责等待 Ctrl+C。
 
-这样打开 ``http://<本机IP>:<共享端口>/webgui`` 就能看到控制台，
-而 ``ftp://<本机IP>:<共享端口>`` 是 FTP，两者同一个端口。
+这样 ``https://<本机IP>:<端口>/webgui`` 是控制台、
+``ftp://<本机IP>:<端口>`` 是 FTP，同一个端口。
 """
 
 from __future__ import annotations
 
 import argparse
+import secrets
 import signal
 import sys
 import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import config as config_mod
 from .db import UserDB
 from .multiplex import DEFAULT_GRACE
 from .server import FTPService, ServiceError
-from .webgui import LogBuffer, WebBackend, WebConsole
+from .tls import TLSError, cert_exists, generate_self_signed_cert
+from .webgui import MOUNT_PATH, LogBuffer, WebBackend, WebConsole
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -52,7 +57,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "但太小时较慢的 HTTP 客户端可能被误判成 FTP"
         ),
     )
+    parser.add_argument(
+        "--no-console-tls", action="store_true",
+        help="不给 Web 控制台启用 HTTPS（默认会生成自签证书并用 HTTPS）",
+    )
     return parser.parse_args(argv)
+
+
+def _prepare_certificate(logs: LogBuffer) -> Tuple[Optional[Path], Optional[Path]]:
+    """有就用，没有就生成；生成不了就退回明文并记一条日志。"""
+    certfile = config_mod.default_certfile()
+    keyfile = config_mod.default_keyfile()
+    if cert_exists(certfile, keyfile):
+        return certfile, keyfile
+    try:
+        generate_self_signed_cert(certfile, keyfile)
+    except TLSError as exc:
+        logs.append(f"[启动] 没能生成自签证书（{exc}），控制台与 FTPS 只能走明文")
+        return None, None
+    logs.append(f"[启动] 已生成自签证书：{certfile}")
+    return certfile, keyfile
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -65,18 +89,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     logs = LogBuffer()
     service = FTPService(db, on_event=logs.append)
     console = WebConsole(db, service, logs)
+
+    certfile, keyfile = (None, None)
+    if not args.no_console_tls:
+        certfile, keyfile = _prepare_certificate(logs)
+
     backend = WebBackend(console)
+    console.backend = backend
+    http_port, https_port = backend.start(certfile=certfile, keyfile=keyfile)
+    logs.append(
+        "[启动] Web 后端就绪："
+        + (f"HTTPS {https_port}" if https_port else f"明文 HTTP {http_port}")
+    )
 
-    # 1) 内部 Web 后端
-    web_port = backend.start()
-    logs.append(f"[启动] Web 后端已在 127.0.0.1:{web_port} 就绪")
-
-    # 2) 共享端口
     port = int(args.port or db.get_setting("port", str(config_mod.DEFAULT_PORT)))
+
     try:
         service.serve(
             port,
-            http_target=("127.0.0.1", web_port),
+            http_target=("127.0.0.1", http_port) if http_port else None,
+            https_target=("127.0.0.1", https_port) if https_port else None,
             host=args.host,
             classify_grace=args.classify_grace,
         )
@@ -89,17 +121,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     db.set_setting("port", str(port))
     logs.append("[启动] 共享端口就绪，FTP 默认处于停止状态")
 
-    if not db.admin_exists():
-        print("！还没有设置管理员密码：第一个打开控制台的人就能设置它。")
-        if args.host not in ("127.0.0.1", "localhost"):
-            print(f"！当前监听在 {args.host}，请尽快打开控制台完成初始化。")
-        print()
-
     print("ftpd 已启动。", flush=True)
-    print(f"  Web 控制台：http://<本机IP>:{port}{config_mod.__dict__.get('MOUNT_HINT', '/webgui')}")
+    for url in service.web_urls():
+        suffix = "（自签证书，浏览器会提示不受信任）" if url.startswith("https") else ""
+        print(f"  Web 控制台：{url}{suffix}")
     print(f"  FTP 登录  ：ftp://<本机IP>:{port}   （先到控制台添加用户并启动 FTP）")
     print(f"  数据库    ：{db_file}")
-    print("按 Ctrl+C 退出。")
+    print(
+        "  控制台策略："
+        + ("HTTPS（明文请求会 301 跳转）" if https_port else "HTTP（未启用 HTTPS）")
+    )
+    print()
+
+    if not db.admin_exists():
+        console.setup_token = secrets.token_urlsafe(9)
+        print("！还没有设置管理员：第一个打开控制台的人可以设置它。")
+        print(f"  初始化口令：{console.setup_token}")
+        print("  （从本机访问不需要口令；其它机器必须把这个口令填进初始化页）")
+        if args.host not in ("127.0.0.1", "localhost"):
+            print(f"！当前监听在 {args.host}，请尽快完成初始化。")
+        print()
+
+    print("按 Ctrl+C 退出。", flush=True)
 
     stop = threading.Event()
 

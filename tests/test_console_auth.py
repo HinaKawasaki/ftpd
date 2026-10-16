@@ -15,6 +15,7 @@ from ftpd.webgui import (
     WebConsole,
     attempt_admin_login,
     create_admin,
+    is_loopback,
 )
 
 
@@ -134,3 +135,50 @@ def test_lock_covers_both_username_and_ip(console):
     ok, message = attempt_admin_login(console, "root", "adminpass1", "10.0.0.10")
     assert ok is False
     assert "失败次数过多" in message
+
+
+# --------------------------------------------------------------------------
+# 首次初始化的口令
+# --------------------------------------------------------------------------
+
+def test_create_admin_needs_token_from_remote(console):
+    console.setup_token = "s3cret-token"
+    ok, message = create_admin(
+        console, "root", "adminpass1", "adminpass1",
+        token="wrong", client_ip="192.168.1.9",
+    )
+    assert ok is False
+    assert "口令" in message
+    assert console.db.admin_exists() is False
+
+    ok, _ = create_admin(
+        console, "root", "adminpass1", "adminpass1",
+        token="s3cret-token", client_ip="192.168.1.9",
+    )
+    assert ok is True
+
+
+def test_create_admin_no_token_needed_from_loopback(console):
+    """能在本机操作的人本来就有 shell 权限，不必再输口令。"""
+    console.setup_token = "s3cret-token"
+    ok, _ = create_admin(
+        console, "root", "adminpass1", "adminpass1",
+        token="", client_ip="127.0.0.1",
+    )
+    assert ok is True
+
+
+def test_create_admin_without_token_configured(console):
+    console.setup_token = None
+    ok, _ = create_admin(
+        console, "root", "adminpass1", "adminpass1", client_ip="10.0.0.7"
+    )
+    assert ok is True
+
+
+def test_is_loopback():
+    assert is_loopback("127.0.0.1") is True
+    assert is_loopback("127.0.0.53") is True
+    assert is_loopback("::1") is True
+    assert is_loopback("192.168.1.5") is False
+    assert is_loopback(None) is False

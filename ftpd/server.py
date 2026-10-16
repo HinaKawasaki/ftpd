@@ -89,21 +89,8 @@ class _CallbackLogHandler(logging.Handler):
             pass
 
 
-def local_ipv4_addresses() -> List[str]:
-    """尽力列出本机的局域网 IPv4 地址。"""
-    addrs: set[str] = set()
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            addrs.add(info[4][0])
-    except OSError:
-        pass
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(("8.8.8.8", 80))
-            addrs.add(sock.getsockname()[0])
-    except OSError:
-        pass
-    return sorted(a for a in addrs if not a.startswith("127."))
+# 从 net 模块再导出，保持 server.local_ipv4_addresses 这个老名字可用
+from .net import local_ipv4_addresses  # noqa: E402,F401
 
 
 class FTPService:
@@ -133,6 +120,7 @@ class FTPService:
 
         self._port: Optional[int] = None
         self._http_target: Optional[Tuple[str, int]] = None
+        self._https_target: Optional[Tuple[str, int]] = None
         self._classify_grace = DEFAULT_GRACE
         self._host = "0.0.0.0"
         self._max_classifiers = DEFAULT_MAX_CLASSIFIERS
@@ -177,11 +165,40 @@ class FTPService:
         return [f"{self._scheme()}://{h}:{self._port}" for h in hosts]
 
     def web_urls(self) -> List[str]:
-        """Web 控制台地址。"""
+        """Web 控制台地址；HTTPS 可用时排在前面。"""
         if not self._port:
             return []
         hosts = local_ipv4_addresses() or ["<本机IP>"]
-        return [f"http://{h}:{self._port}/webgui" for h in hosts]
+        urls: List[str] = []
+        if self._https_target:
+            urls += [f"https://{h}:{self._port}/webgui" for h in hosts]
+        if self._http_target:
+            urls += [f"http://{h}:{self._port}/webgui" for h in hosts]
+        return urls
+
+    @property
+    def https_available(self) -> bool:
+        """HTTPS 后端是否在跑。"""
+        return self._https_target is not None
+
+    @property
+    def tls_required(self) -> bool:
+        """控制台是否只走 HTTPS（即没有明文后端，明文会被 301 跳走）。"""
+        return self._https_target is not None and self._http_target is None
+
+    def set_web_targets(
+        self,
+        http_target: Optional[Tuple[str, int]],
+        https_target: Optional[Tuple[str, int]],
+    ) -> None:
+        """热更新 Web 后端地址（换证书重启后端时用）。"""
+        with self._lock:
+            self._http_target = http_target
+            self._https_target = https_target
+            server = self._server
+        if server is not None:
+            server.http_target = http_target
+            server.https_target = https_target
 
     # ------------------------------------------------------------------
     # 事件
@@ -214,6 +231,7 @@ class FTPService:
         port: int,
         *,
         http_target: Optional[Tuple[str, int]] = None,
+        https_target: Optional[Tuple[str, int]] = None,
         host: str = "0.0.0.0",
         classify_grace: float = DEFAULT_GRACE,
         max_classifiers: int = DEFAULT_MAX_CLASSIFIERS,
@@ -237,6 +255,7 @@ class FTPService:
                     (host, int(port)),
                     self._placeholder_handler(),
                     http_target=http_target,
+                    https_target=https_target,
                     on_event=self._emit,
                     classify_grace=classify_grace,
                     max_classifiers=max_classifiers,
@@ -254,6 +273,7 @@ class FTPService:
             self._server = server
             self._port = int(port)
             self._http_target = http_target
+            self._https_target = https_target
             self._classify_grace = classify_grace
             self._host = host
             self._max_classifiers = max_classifiers
@@ -267,7 +287,9 @@ class FTPService:
             self._thread.start()
 
         self._emit(f"共享端口已就绪：{host}:{port}")
-        if http_target:
+        if https_target:
+            self._emit(f"Web 控制台：https://<本机IP>:{port}/webgui")
+        elif http_target:
             self._emit(f"Web 控制台：http://<本机IP>:{port}/webgui")
 
     def _serve_loop(self) -> None:
@@ -290,6 +312,7 @@ class FTPService:
             if self._server is None:
                 raise ServiceError("前端还没启动，无法切换端口")
             http_target = self._http_target
+            https_target = self._https_target
             classify_grace = self._classify_grace
             max_classifiers = self._max_classifiers
             max_proxies = self._max_proxies
@@ -304,6 +327,7 @@ class FTPService:
         self.serve(
             port,
             http_target=http_target,
+            https_target=https_target,
             host=host,
             classify_grace=classify_grace,
             max_classifiers=max_classifiers,

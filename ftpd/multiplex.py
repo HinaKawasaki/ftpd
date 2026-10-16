@@ -42,6 +42,9 @@ from pyftpdlib.servers import FTPServer
 EventCallback = Callable[[str], None]
 Target = Tuple[str, int]
 
+#: TLS 握手记录的前两个字节（ClientHello, content-type=22, major=3）
+TLS_HANDSHAKE_PREFIX = b"\x16\x03"
+
 #: HTTP 请求行可能的前缀（含 HTTP/2 的 PRI 前导）
 HTTP_PREFIXES = (
     b"GET ", b"POST", b"HEAD", b"PUT ", b"OPTI", b"DELE",
@@ -65,10 +68,24 @@ def close_quietly(sock: socket.socket) -> None:
         pass
 
 
-def classify_protocol(sock: socket.socket, grace: float = DEFAULT_GRACE) -> str:
-    """窥探首包判断这是 HTTP 还是 FTP 连接。
+def classify_head(head: bytes) -> str:
+    """根据首包字节判断协议。"""
+    if head[:2] == TLS_HANDSHAKE_PREFIX:
+        return "tls"
+    if head.startswith(HTTP_PREFIXES):
+        return "http"
+    return "ftp"
 
-    返回 ``"http"`` / ``"ftp"`` / ``"closed"``。数据只用 MSG_PEEK 看，不消费。
+
+def classify_protocol(sock: socket.socket, grace: float = DEFAULT_GRACE) -> str:
+    """窥探首包判断这是什么协议的连接。
+
+    返回 ``"tls"`` / ``"http"`` / ``"ftp"`` / ``"closed"``。
+    数据只用 ``MSG_PEEK`` 看，不消费。
+
+    ``tls`` / ``http`` 的客户端都会立刻发数据，一读就知道；
+    FTP 客户端会等服务器先发问候语，所以要等到超时才能判定。
+    等待用 ``select`` 而不是轮询 sleep：既能立刻被数据唤醒，也不空转 CPU。
     """
     previous_timeout = sock.gettimeout()
     sock.setblocking(False)
@@ -84,15 +101,46 @@ def classify_protocol(sock: socket.socket, grace: float = DEFAULT_GRACE) -> str:
             if head is not None:
                 if head == b"":
                     return "closed"  # 对端关闭，EOF
-                return "http" if head.startswith(HTTP_PREFIXES) else "ftp"
-            if time.monotonic() >= deadline:
+                return classify_head(head)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return "ftp"         # 一声不吭 —— 典型的 FTP 客户端
-            time.sleep(0.005)
+            try:
+                readable, _, _ = select.select([sock], [], [], remaining)
+            except (OSError, ValueError):
+                return "closed"
+            if not readable:
+                return "ftp"
     finally:
         try:
             sock.settimeout(previous_timeout)
         except OSError:
             pass
+
+
+def request_path(head: bytes) -> str:
+    """从请求头里取出路径，取不到就返回 "/"。"""
+    try:
+        first_line = head.split(b"\r\n", 1)[0].decode("latin-1")
+        parts = first_line.split()
+        if len(parts) >= 2 and parts[1].startswith("/"):
+            return parts[1]
+    except Exception:
+        pass
+    return "/"
+
+
+def request_host(head: bytes) -> str:
+    """从请求头里取出 Host（不含端口），取不到返回空串。"""
+    try:
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"host":
+                return value.strip().decode("latin-1").split(":")[0]
+    except Exception:
+        pass
+    return ""
 
 
 def _read_http_head(sock: socket.socket, *, limit: int = 65536,
@@ -264,6 +312,7 @@ class MultiplexedFTPServer(FTPServer):
         handler,
         *,
         http_target: Optional[Target] = None,
+        https_target: Optional[Target] = None,
         on_event: Optional[EventCallback] = None,
         classify_grace: float = DEFAULT_GRACE,
         max_classifiers: int = DEFAULT_MAX_CLASSIFIERS,
@@ -271,6 +320,7 @@ class MultiplexedFTPServer(FTPServer):
     ) -> None:
         super().__init__(address, handler)
         self.http_target = http_target
+        self.https_target = https_target
         self.on_event = on_event
         self.classify_grace = classify_grace
         self.ftp_enabled = True
@@ -318,10 +368,21 @@ class MultiplexedFTPServer(FTPServer):
             close_quietly(sock)
             return
 
+        if kind == "tls":
+            if self.https_target:
+                self._start_proxy(sock, addr, self.https_target)
+            else:
+                self._emit("收到 TLS 连接，但没有启动 HTTPS 后端")
+                close_quietly(sock)
+            return
+
         if kind == "http":
             if self.http_target:
                 # 不逐条记录 Web 访问，否则浏览器一开就把日志刷爆了
-                self._start_proxy(sock, addr)
+                self._start_proxy(sock, addr, self.http_target)
+            elif self.https_target:
+                # 只跑了 HTTPS 后端，明文请求就 301 跳过去
+                self._redirect_to_https(sock, addr)
             else:
                 self._emit("收到 HTTP 连接，但没有启动 Web 后端")
                 self._reject(sock, "Web 控制台未启动")
@@ -338,8 +399,8 @@ class MultiplexedFTPServer(FTPServer):
             return
         self._inject.put((sock, addr))
 
-    def _start_proxy(self, sock: socket.socket, addr) -> None:
-        """把 HTTP 连接的转发交给独立线程，立刻还回分类线程池的 worker。
+    def _start_proxy(self, sock: socket.socket, addr, target: Target) -> None:
+        """把 Web 连接的转发交给独立线程，立刻还回分类线程池的 worker。
 
         ``proxy_to`` 会一直跑到连接结束（WebSocket 可能是几十分钟），
         所以绝不能占用分类线程池。
@@ -349,7 +410,6 @@ class MultiplexedFTPServer(FTPServer):
             self._reject(sock, "503 Service Unavailable")
             return
 
-        target = self.http_target
         client_ip = addr[0] if addr else None
 
         def run() -> None:
@@ -364,6 +424,30 @@ class MultiplexedFTPServer(FTPServer):
             self._proxy_socks.add(sock)
 
         threading.Thread(target=run, name="ftpd-proxy", daemon=True).start()
+
+    def _redirect_to_https(self, sock: socket.socket, addr=None) -> None:
+        """强制 HTTPS 时，把明文请求 301 到同端口的 https。"""
+        head = _read_http_head(sock, timeout=3.0)
+        path = request_path(head)
+        host = request_host(head) or (addr[0] if addr else "localhost")
+        try:
+            port = self.socket.getsockname()[1]
+        except OSError:
+            port = 443
+        location = f"https://{host}:{port}{path}"
+        body = f"Redirecting to {location}\n".encode("utf-8")
+        response = (
+            b"HTTP/1.1 301 Moved Permanently\r\n"
+            b"Location: " + location.encode("latin-1", "replace") + b"\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+        try:
+            sock.sendall(response)
+        except OSError:
+            pass
+        close_quietly(sock)
 
     def _reject(self, sock: socket.socket, message: str) -> None:
         if not message.endswith("\r\n"):

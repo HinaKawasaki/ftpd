@@ -21,9 +21,12 @@ import pytest
 from ftpd.multiplex import (
     _inject_forwarded_for,
     _read_http_head,
+    classify_head,
     classify_protocol,
     close_quietly,
     proxy_to,
+    request_host,
+    request_path,
 )
 
 
@@ -258,3 +261,38 @@ def test_read_http_head_reads_up_to_blank_line():
     finally:
         close_quietly(a)
         close_quietly(b)
+
+
+# --------------------------------------------------------------------------
+# TLS 嗅探与请求行解析
+# --------------------------------------------------------------------------
+
+def test_classify_head_detects_tls():
+    # TLS ClientHello：content-type=22(0x16), version major=3
+    assert classify_head(b"\x16\x03\x01\x00\xa5\x01\x00\x00") == "tls"
+    assert classify_head(b"GET /web") == "http"
+    assert classify_head(b"USER al") == "ftp"
+
+
+def test_classify_protocol_detects_tls_handshake():
+    a, b = _pair()
+    try:
+        b.sendall(bytes([0x16, 0x03, 0x01, 0x00, 0xA5, 0x01, 0x00, 0x00]))
+        assert classify_protocol(a, 0.3) == "tls"
+        # 依然不能消费数据：TLS 握手得完整交给后端
+        assert a.recv(2) == bytes([0x16, 0x03])
+    finally:
+        close_quietly(a)
+        close_quietly(b)
+
+
+def test_request_path_and_host_parsing():
+    head = b"GET /webgui/ HTTP/1.1\r\nHost: 192.168.1.5:2121\r\n\r\n"
+    assert request_path(head) == "/webgui/"
+    assert request_host(head) == "192.168.1.5"
+
+
+def test_request_parsing_is_forgiving():
+    assert request_path(b"junk") == "/"
+    assert request_host(b"junk") == ""
+    assert request_path(b"") == "/"

@@ -16,6 +16,7 @@ NiceGUI 的页面是「每个浏览器标签页一个实例」，而 FTP 服务�
 
 from __future__ import annotations
 
+import hmac
 import socket
 import threading
 import time
@@ -87,6 +88,10 @@ class WebConsole:
         self.logs = logs
         #: Web 控制台的登录限流（与 FTP 的分开统计）
         self.admin_throttle = LoginThrottle()
+        #: 首次初始化的口令；只在还没设置管理员时存在
+        self.setup_token: Optional[str] = None
+        #: 由 app 层回填，便于在界面上重启 HTTPS 后端
+        self.backend: Optional["WebBackend"] = None
 
 
 def _format_duration(seconds: float) -> str:
@@ -131,10 +136,32 @@ def attempt_admin_login(
     return True, "登录成功"
 
 
+def is_loopback(ip: Optional[str]) -> bool:
+    """是否是本机来源。"""
+    if not ip:
+        return False
+    return ip.startswith("127.") or ip in ("::1", "localhost")
+
+
 def create_admin(
-    console: "WebConsole", username: str, password: str, confirm: str
+    console: "WebConsole",
+    username: str,
+    password: str,
+    confirm: str,
+    *,
+    token: str = "",
+    client_ip: Optional[str] = None,
 ) -> Tuple[bool, str]:
-    """首次运行时创建管理员，返回 (是否成功, 提示语)。"""
+    """首次运行时创建管理员，返回 (是否成功, 提示语)。
+
+    还没设管理员时，任何人都能打开初始化页 —— 所以启动时会生成一个一次性口令。
+    本机（回环）访问不需要口令：能操作本机的人本来就有 shell 权限；
+    其它来源必须提供口令，否则「谁先打开谁当管理员」的窗口就堵不住。
+    """
+    if console.setup_token and not is_loopback(client_ip):
+        if not hmac.compare_digest((token or "").strip(), console.setup_token):
+            return False, "初始化口令不正确（见启动时终端打印的口令）"
+
     if (password or "") != (confirm or ""):
         return False, "两次输入的密码不一致"
     try:
@@ -422,6 +449,8 @@ def build_page(console: WebConsole) -> None:
                     )
                 tls_status_label = ui.label("").classes("text-xs")
 
+                console_scheme_label = ui.label("").classes("text-xs")
+
                 def collect_config() -> Tuple[ServerConfig, int]:
                     directory_text = (directory_input.value or "").strip()
                     directory = (
@@ -525,6 +554,24 @@ def build_page(console: WebConsole) -> None:
                     except TLSError as exc:
                         ui.notify(f"生成失败：{exc}", type="negative")
                         return
+
+                    # 证书换新后，把用到它的两处立刻切过去
+                    backend = console.backend
+                    if backend is not None:
+                        https_port = backend.restart_https(cert, key)
+                        if https_port:
+                            service.set_web_targets(None, ("127.0.0.1", https_port))
+                            logs.append("[证书] HTTPS 后端已用新证书重启")
+                        elif backend.http_port:
+                            logs.append(
+                                "[证书] 控制台当前是明文模式；重启后即可用 HTTPS 访问"
+                            )
+                        else:
+                            logs.append("[证书] HTTPS 后端启动失败")
+                    if service.ftp_enabled and service.config and service.config.use_tls:
+                        service.enable(service.config)
+                        logs.append("[证书] FTPS 已用新证书重启")
+
                     refresh_tls_status()
                     ui.notify(f"自签证书已生成：{cert}", type="positive")
 
@@ -594,6 +641,12 @@ def build_page(console: WebConsole) -> None:
             else ""
         )
 
+        console_scheme_label.set_text(
+            "控制台协议：HTTPS（明文请求会 301 跳转）"
+            if service.https_available
+            else "控制台协议：HTTP（未启用 HTTPS，可用 --no-console-tls 之外的方式开启）"
+        )
+
         locked = service.throttle.locked_accounts()
         if locked:
             items = "，".join(f"{k}（{int(v)}s）" for k, v in locked.items())
@@ -633,7 +686,10 @@ def _redirect_js(new_port: int) -> str:
         fetch(base + "/healthz", {{cache: "no-store", mode: "no-cors"}})
           .then(function () {{ window.location.href = target; }})
           .catch(function () {{
-            if (tries < 60) setTimeout(attempt, 500);
+            // 自签证书会让 fetch 因证书校验失败而永远探测不通，
+            // 所以试够次数就直接跳，总比停在已经断掉的旧页面上强。
+            if (tries < 20) setTimeout(attempt, 500);
+            else window.location.href = target;
           }});
       }}
       setTimeout(attempt, 1500);
@@ -688,11 +744,16 @@ def build_setup_page(console: WebConsole) -> None:
                 placeholder="至少 6 位",
             ).classes("w-full")
             confirm = ui.input("再输一次", password=True).classes("w-full")
+            token_input = ui.input(
+                "初始化口令",
+                placeholder="本机访问可留空；其它机器请填终端里打印的口令",
+            ).classes("w-full")
 
             def do_setup() -> None:
                 ok, message = create_admin(
                     console, username.value or "", password.value or "",
                     confirm.value or "",
+                    token=token_input.value or "", client_ip=client_ip(),
                 )
                 if not ok:
                     ui.notify(message, type="negative")
@@ -717,10 +778,14 @@ class WebBackend:
 
     def __init__(self, console: WebConsole) -> None:
         self.console = console
+        self.host = "127.0.0.1"
         self.app: FastAPI = self._build_app()
-        self._server: Optional[uvicorn.Server] = None
-        self._thread: Optional[threading.Thread] = None
-        self.port: Optional[int] = None
+        self.http_port: Optional[int] = None
+        self.https_port: Optional[int] = None
+        self.certfile: Optional[Path] = None
+        self.keyfile: Optional[Path] = None
+        self._http: Optional[Tuple[uvicorn.Server, threading.Thread]] = None
+        self._https: Optional[Tuple[uvicorn.Server, threading.Thread]] = None
 
     def _build_app(self) -> FastAPI:
         console = self.console
@@ -779,41 +844,101 @@ class WebBackend:
         )
         return api
 
-    def start(self, host: str = "127.0.0.1") -> int:
-        """启动内部 Web 服务，返回它监听的端口。"""
-        if self._thread is not None:
-            raise RuntimeError("Web 后端已经启动了")
-
+    def _serve_one(self, *, certfile=None, keyfile=None):
+        """起一个内部 uvicorn，返回 (server, thread, port)。"""
         with socket.socket() as probe:
-            probe.bind((host, 0))
+            probe.bind((self.host, 0))
             port = int(probe.getsockname()[1])
 
         config = uvicorn.Config(
-            self.app, host=host, port=port, log_level="warning", ws="auto",
+            self.app, host=self.host, port=port, log_level="warning", ws="auto",
             access_log=False,
             # 前置的端口复用器会给每条连接注入 X-Forwarded-For，
             # 它来自回环地址，所以只信任回环
             proxy_headers=True,
             forwarded_allow_ips="127.0.0.1",
+            ssl_certfile=str(certfile) if certfile else None,
+            ssl_keyfile=str(keyfile) if keyfile else None,
         )
-        self._server = uvicorn.Server(config)
-        self.port = port
-        self._thread = threading.Thread(
-            target=self._server.run, name="ftpd-web", daemon=True
-        )
-        self._thread.start()
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, name="ftpd-web", daemon=True)
+        thread.start()
 
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            if getattr(self._server, "started", False):
+            if getattr(server, "started", False):
                 break
+            if not thread.is_alive():
+                raise RuntimeError("Web 后端线程提前退出")
             time.sleep(0.05)
+        return server, thread, port
+
+    @staticmethod
+    def _shutdown(pair) -> None:
+        if pair is None:
+            return
+        server, thread = pair
+        server.should_exit = True
+        if thread.is_alive():
+            thread.join(timeout=5)
+
+    def start(self, host: str = "127.0.0.1", *, certfile=None, keyfile=None):
+        """启动内部 Web 服务，返回 (明文端口或 None, HTTPS 端口或 None)。
+
+        **只会起一个后端**：有证书就走 HTTPS，没有就走明文。
+
+        为什么不 HTTP 和 HTTPS 各起一个：NiceGUI 的 ``Slot.stacks`` 是模块级全局字典、
+        按 asyncio 任务 id 索引（``nicegui/slot.py``）；两个事件循环同时用它会出现
+        id 复用，导致 ``IndexError: pop from empty list`` 之类的内部崩溃——实测复现过。
+        """
+        if self._http is not None or self._https is not None:
+            raise RuntimeError("Web 后端已经启动了")
+        self.host = host
+
+        if certfile and keyfile:
+            port = self.start_https(certfile, keyfile)
+            if port is not None:
+                return None, port
+            self.console.logs.append("[警告] HTTPS 后端起不来，退回明文 HTTP")
+
+        server, thread, self.http_port = self._serve_one()
+        self._http = (server, thread)
+        return self.http_port, None
+
+    def start_https(self, certfile, keyfile) -> Optional[int]:
+        """启动 HTTPS 后端；失败只记日志。
+
+        如果明文后端已经在跑，这里直接拒绝——一个 NiceGUI 应用不能同时挂两个事件循环。
+        """
+        if self._http is not None:
+            self.console.logs.append(
+                "[警告] 明文控制台后端已在运行，无法同时启用 HTTPS（需重启进程）"
+            )
+            return None
+        self._shutdown(self._https)
+        self._https = None
+        self.https_port = None
+        try:
+            server, thread, port = self._serve_one(
+                certfile=certfile, keyfile=keyfile
+            )
+        except Exception as exc:  # pragma: no cover - 证书坏了之类
+            self.console.logs.append(f"[警告] HTTPS 后端启动失败：{exc}")
+            return None
+        self._https = (server, thread)
+        self.https_port = port
+        self.certfile, self.keyfile = Path(certfile), Path(keyfile)
         return port
 
+    def restart_https(self, certfile, keyfile) -> Optional[int]:
+        """换证书后重启 HTTPS 后端；本来没跑 HTTPS 就什么都不做。"""
+        if self._https is None:
+            return None
+        return self.start_https(certfile, keyfile)
+
     def stop(self) -> None:
-        server, self._server = self._server, None
-        thread, self._thread = self._thread, None
-        if server is not None:
-            server.should_exit = True
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=5)
+        self._shutdown(self._https)
+        self._shutdown(self._http)
+        self._https = None
+        self._http = None
+        self.https_port = None

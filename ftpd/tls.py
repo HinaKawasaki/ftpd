@@ -1,7 +1,10 @@
 """自签 TLS 证书的生成。
 
-FTPS 需要一个证书。这里直接调用系统的 ``openssl`` 命令行生成自签证书，
-避免为了一个功能再引入 heavy 的 ``cryptography`` 依赖。
+FTPS 和 Web 控制台的 HTTPS 用的是同一张证书。这里直接调用系统的
+``openssl`` 命令行生成，避免为了一个功能再引入 heavy 的 ``cryptography`` 依赖。
+
+证书的 SAN 里会带上本机的局域网 IP —— 否则用 IP 访问时浏览器会额外报
+「名称不匹配」，虽然自签证书本来就要手动信任，但少一个错误少一分困惑。
 """
 
 from __future__ import annotations
@@ -9,7 +12,9 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Union
+from typing import List, Union
+
+from .net import local_ipv4_addresses
 
 DEFAULT_DAYS = 3650  # 10 年，自签证书，省得过期
 
@@ -22,6 +27,20 @@ def openssl_available() -> bool:
     return shutil.which("openssl") is not None
 
 
+def _subject_alt_names(common_name: str) -> str:
+    entries: List[str] = [
+        f"DNS:{common_name}",
+        "DNS:localhost",
+    ]
+    seen = {common_name, "localhost"}
+    for ip in ["127.0.0.1", "::1", *local_ipv4_addresses()]:
+        if ip in seen:
+            continue
+        seen.add(ip)
+        entries.append(f"IP:{ip}")
+    return ",".join(entries)
+
+
 def generate_self_signed_cert(
     certfile: Union[str, Path],
     keyfile: Union[str, Path],
@@ -30,10 +49,7 @@ def generate_self_signed_cert(
     days: int = DEFAULT_DAYS,
     key_size: int = 2048,
 ) -> tuple[Path, Path]:
-    """生成自签证书与私钥，返回 (certfile, keyfile)。
-
-    重复调用会覆盖已有文件。私钥以 0600 权限写入。
-    """
+    """生成自签证书与私钥，返回 (certfile, keyfile)。重复调用会覆盖。"""
     cert_path = Path(certfile).expanduser()
     key_path = Path(keyfile).expanduser()
     cert_path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,7 +64,7 @@ def generate_self_signed_cert(
         "-out", str(cert_path),
         "-days", str(days),
         "-subj", f"/CN={common_name}",
-        "-addext", f"subjectAltName=DNS:{common_name},DNS:localhost,IP:127.0.0.1",
+        "-addext", f"subjectAltName={_subject_alt_names(common_name)}",
     ]
     try:
         proc = subprocess.run(
@@ -71,3 +87,15 @@ def generate_self_signed_cert(
 
 def cert_exists(certfile: Union[str, Path], keyfile: Union[str, Path]) -> bool:
     return Path(certfile).expanduser().is_file() and Path(keyfile).expanduser().is_file()
+
+
+def ensure_self_signed_cert(
+    certfile: Union[str, Path],
+    keyfile: Union[str, Path],
+    *,
+    common_name: str = "ftpd",
+) -> tuple[Path, Path]:
+    """证书已存在就直接用，不存在才生成。"""
+    if cert_exists(certfile, keyfile):
+        return Path(certfile).expanduser(), Path(keyfile).expanduser()
+    return generate_self_signed_cert(certfile, keyfile, common_name=common_name)

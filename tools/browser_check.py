@@ -101,7 +101,8 @@ def ftp_roundtrip(port: int, expect_file: str) -> str:
 
 
 def run(port: int, new_port: int, chrome: str, keep_shots: Path | None) -> int:
-    base = f"http://127.0.0.1:{port}/webgui/"
+    # 控制台默认强制 HTTPS，而且是自签证书，所以要忽略证书错误
+    base = f"https://127.0.0.1:{port}/webgui/"
     share = Path(tempfile.mkdtemp(prefix="ftpd-browser-"))
     (share / "readme.txt").write_text("hello ftp\n", encoding="utf-8")
 
@@ -110,7 +111,10 @@ def run(port: int, new_port: int, chrome: str, keep_shots: Path | None) -> int:
             executable_path=chrome, headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-        page = browser.new_page(viewport={"width": 1400, "height": 950})
+        context = browser.new_context(
+            ignore_https_errors=True, viewport={"width": 1400, "height": 950}
+        )
+        page = context.new_page()
 
         print("1) 首次访问 → 初始化管理员")
         open_and_wait(page, base, "text=第一次使用")
@@ -118,6 +122,7 @@ def run(port: int, new_port: int, chrome: str, keep_shots: Path | None) -> int:
         inputs.nth(0).fill(ADMIN_USER)
         inputs.nth(1).fill(ADMIN_PASS)
         inputs.nth(2).fill(ADMIN_PASS)
+        # 第 4 个输入框是初始化口令；从本机访问不需要填
         # 程序化填值后要留点时间让 NiceGUI 把值同步到服务端，否则点击时服务端还是旧值
         page.wait_for_timeout(800)
         page.get_by_role("button", name="创建并进入").click()
@@ -156,7 +161,9 @@ def run(port: int, new_port: int, chrome: str, keep_shots: Path | None) -> int:
         if keep_shots:
             keep_shots.mkdir(parents=True, exist_ok=True)
             page.locator("div.q-tab:has-text('服务')").click()
-            page.wait_for_timeout(800)
+            # 等面板真的切换过去再截图，否则拍到的还是上一个标签页
+            page.wait_for_selector("text=运行状态", timeout=15_000)
+            page.wait_for_timeout(600)
             page.screenshot(path=str(keep_shots / "service.png"))
             print(f"   截图 → {keep_shots / 'service.png'}")
 
