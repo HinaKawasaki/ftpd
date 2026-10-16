@@ -160,3 +160,34 @@ def test_web_still_works_after_ftp_is_stopped(stack):
 
 def test_error_log_is_collected(stack):
     assert any("共享端口" in line or "FTP" in line for line in stack.logs.snapshot())
+
+
+# --------------------------------------------------------------------------
+# 控制台登录鉴权
+# --------------------------------------------------------------------------
+
+def final_url(port: int, path: str, timeout: float = 15.0) -> str:
+    """跟随重定向，返回最终落地的 URL。"""
+    with http_get(port, path, timeout=timeout) as response:
+        return response.geturl()
+
+
+def test_healthz_does_not_leak_ftp_state(stack):
+    with http_get(stack.port, "/healthz") as response:
+        payload = response.read()
+    assert payload.strip() == b'{"ok":true}'
+
+
+def test_console_goes_to_setup_when_no_admin(stack):
+    """还没设管理员时，访问控制台会被引导去初始化。"""
+    assert stack.db.admin_exists() is False
+    assert final_url(stack.port, "/webgui").rstrip("/").endswith("/setup")
+
+
+def test_console_requires_login_once_admin_exists(stack):
+    stack.db.set_admin("admin", "adminpass1")
+    assert final_url(stack.port, "/webgui").rstrip("/").endswith("/login")
+    with http_get(stack.port, "/webgui/login") as response:
+        assert response.status == 200
+    # 退出登录后回到登录页
+    assert final_url(stack.port, "/webgui/logout").rstrip("/").endswith("/login")

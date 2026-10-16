@@ -94,3 +94,79 @@ def test_passwords_are_not_kept_in_the_authorizer(db, share):
     auth = make_authorizer(db, share)
     assert auth.user_table == {}
     assert not any("secret123" in str(v) for v in auth.user_table.values())
+
+
+# --------------------------------------------------------------------------
+# 登录限流接入
+# --------------------------------------------------------------------------
+
+class FakeHandler:
+    """只提供 remote_ip 的假 handler。"""
+
+    def __init__(self, ip="10.0.0.5"):
+        self.remote_ip = ip
+
+
+def _throttle(max_attempts=3):
+    from ftpd.security import LoginThrottle
+
+    return LoginThrottle(max_attempts=max_attempts, window=60, lockout=120)
+
+
+def test_throttle_locks_after_repeated_failures(db, share):
+    throttle = _throttle()
+    db.add_user("alice", "secret123")
+    auth = DBFTPAuthorizer(db, share, readonly=True, throttle=throttle)
+    handler = FakeHandler()
+
+    for _ in range(3):
+        with pytest.raises(AuthenticationFailed):
+            auth.validate_authentication("alice", "wrong", handler)
+
+    # 锁上之后，即使密码是对的也进不来
+    with pytest.raises(AuthenticationFailed, match="Too many failed attempts"):
+        auth.validate_authentication("alice", "secret123", handler)
+
+
+def test_throttle_success_resets_counter(db, share):
+    throttle = _throttle()
+    db.add_user("alice", "secret123")
+    auth = DBFTPAuthorizer(db, share, throttle=throttle)
+    handler = FakeHandler()
+
+    for _ in range(2):
+        with pytest.raises(AuthenticationFailed):
+            auth.validate_authentication("alice", "wrong", handler)
+    auth.validate_authentication("alice", "secret123", handler)
+
+    # 计数已清零，再失败两次仍不到阈值
+    for _ in range(2):
+        with pytest.raises(AuthenticationFailed):
+            auth.validate_authentication("alice", "wrong", handler)
+    assert throttle.lock_remaining(("user:alice",)) == 0.0
+
+
+def test_throttle_blocks_by_ip_across_usernames(db, share):
+    throttle = _throttle()
+    for name in ("alice", "bob", "carol"):
+        db.add_user(name, "secret123")
+    auth = DBFTPAuthorizer(db, share, throttle=throttle)
+    handler = FakeHandler(ip="10.0.0.9")
+
+    for name in ("alice", "bob", "carol"):
+        with pytest.raises(AuthenticationFailed):
+            auth.validate_authentication(name, "wrong", handler)
+
+    # 同一台机器换个账号照样被挡
+    db.add_user("dave", "secret123")
+    with pytest.raises(AuthenticationFailed, match="Too many failed attempts"):
+        auth.validate_authentication("dave", "secret123", handler)
+
+
+def test_without_throttle_failures_never_lock(db, share):
+    db.add_user("alice", "secret123")
+    auth = DBFTPAuthorizer(db, share)  # 不传 throttle
+    for _ in range(10):
+        with pytest.raises(AuthenticationFailed):
+            auth.validate_authentication("alice", "wrong", None)
+    auth.validate_authentication("alice", "secret123", None)

@@ -26,10 +26,11 @@ from typing import Dict, List, Optional, Tuple
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
-from nicegui import ui
+from nicegui import app, ui
 
 from . import config as config_mod
 from .db import UserDB, ValidationError
+from .security import LoginThrottle, attempt_keys
 from .server import FTPService, ServerConfig, ServiceError
 from .tls import TLSError, cert_exists, generate_self_signed_cert
 
@@ -84,6 +85,8 @@ class WebConsole:
         self.db = db
         self.service = service
         self.logs = logs
+        #: Web 控制台的登录限流（与 FTP 的分开统计）
+        self.admin_throttle = LoginThrottle()
 
 
 def _format_duration(seconds: float) -> str:
@@ -99,6 +102,62 @@ def _format_duration(seconds: float) -> str:
 # 页面
 # --------------------------------------------------------------------------
 
+
+def client_ip() -> Optional[str]:
+    """当前浏览器连接的来源地址（拿不到就返回 None）。"""
+    try:
+        return getattr(ui.context.client, "ip", None)
+    except Exception:
+        return None
+
+
+def attempt_admin_login(
+    console: "WebConsole", username: str, password: str, ip: Optional[str] = None
+) -> Tuple[bool, str]:
+    """校验管理员登录，返回 (是否成功, 提示语)。
+
+    抽成纯函数是为了能脱离浏览器直接测试。
+    """
+    keys = attempt_keys(username or "", ip)
+    remaining = console.admin_throttle.lock_remaining(keys)
+    if remaining > 0:
+        return False, f"失败次数过多，请 {int(remaining) + 1} 秒后再试"
+
+    if not console.db.verify_admin(username or "", password or ""):
+        console.admin_throttle.record_failure(keys)
+        return False, "用户名或密码错误"
+
+    console.admin_throttle.record_success(keys)
+    return True, "登录成功"
+
+
+def create_admin(
+    console: "WebConsole", username: str, password: str, confirm: str
+) -> Tuple[bool, str]:
+    """首次运行时创建管理员，返回 (是否成功, 提示语)。"""
+    if (password or "") != (confirm or ""):
+        return False, "两次输入的密码不一致"
+    try:
+        console.db.set_admin(username or "admin", password or "")
+    except ValidationError as exc:
+        return False, f"设置失败：{exc}"
+    return True, "管理员已创建"
+
+
+def login_redirect(console: "WebConsole") -> Optional[RedirectResponse]:
+    """页面守卫。
+
+    注意：**页面函数里不能靠 ``ui.navigate.to`` 跳转**（那时浏览器还没连上，
+    JS 发不出去），必须返回一个 ``RedirectResponse``；NiceGUI 见到页面函数
+    返回 Response 就不再渲染页面。事件处理器里则相反，用 ``ui.navigate.to``。
+    """
+    if not console.db.admin_exists():
+        return RedirectResponse(f"{MOUNT_PATH}/setup")
+    if not app.storage.user.get("admin"):
+        return RedirectResponse(f"{MOUNT_PATH}/login")
+    return None
+
+
 def build_page(console: WebConsole) -> None:
     db = console.db
     service = console.service
@@ -113,7 +172,13 @@ def build_page(console: WebConsole) -> None:
         with ui.row().classes("items-center gap-2"):
             ui.icon("dns").classes("text-2xl")
             ui.label("ftpd 控制台").classes("text-lg font-semibold")
-        header_status = ui.label("").classes("text-sm opacity-90")
+        with ui.row().classes("items-center gap-3"):
+            header_status = ui.label("").classes("text-sm opacity-90")
+            ui.label(f"管理员：{db.admin_username()}").classes("text-xs opacity-90")
+            ui.button(
+                "退出", icon="logout",
+                on_click=lambda: ui.navigate.to("/logout"),
+            ).props("flat dense color=white")
 
     # ---------------- 用户管理 ----------------
     @ui.refreshable
@@ -288,6 +353,36 @@ def build_page(console: WebConsole) -> None:
                 count_label = ui.label(user_count_label()).classes("text-sm")
                 users_table()
 
+            with ui.card().classes("w-full"):
+                ui.label("管理员密码").classes("text-base font-semibold")
+                ui.label(
+                    f"当前管理员：{db.admin_username()}"
+                    "（只用于登录这个控制台，与 FTP 用户无关）"
+                ).classes("text-xs opacity-70")
+                current_admin_pw = ui.input(
+                    "当前密码", password=True, password_toggle_button=True
+                ).classes("w-72")
+                new_admin_pw = ui.input(
+                    "新密码", password=True, password_toggle_button=True
+                ).classes("w-72")
+
+                def change_admin_password() -> None:
+                    if not db.verify_admin(
+                        db.admin_username(), current_admin_pw.value or ""
+                    ):
+                        ui.notify("当前密码不正确", type="negative")
+                        return
+                    try:
+                        db.set_admin(db.admin_username(), new_admin_pw.value or "")
+                    except ValidationError as exc:
+                        ui.notify(f"修改失败：{exc}", type="negative")
+                        return
+                    current_admin_pw.value = ""
+                    new_admin_pw.value = ""
+                    ui.notify("管理员密码已更新", type="positive")
+
+                ui.button("修改密码", icon="password", on_click=change_admin_password)
+
         # ==================== 服务 ====================
         with ui.tab_panel(tab_service):
             with ui.card().classes("w-full"):
@@ -398,14 +493,24 @@ def build_page(console: WebConsole) -> None:
                             f"请改用 http://<本机IP>:{new_port}{MOUNT_PATH} 重新打开控制台。"
                         ).classes("text-sm")
 
+                        def do_rebind(port_number: int) -> None:
+                            try:
+                                service.rebind(port_number)
+                            except ServiceError as exc:
+                                logs.append(f"[错误] 切换端口失败：{exc}")
+
                         def confirm() -> None:
                             dialog.close()
+                            # 先把跳转脚本交给浏览器，再执行会断开连接的切换
                             try:
-                                service.rebind(new_port)
-                            except ServiceError as exc:
-                                ui.notify(f"切换失败：{exc}", type="negative")
-                                return
-                            ui.notify(f"已切换到端口 {new_port}", type="positive")
+                                ui.run_javascript(_redirect_js(new_port))
+                            except Exception:
+                                pass
+                            ui.notify(
+                                f"正在切换到端口 {new_port}，页面会自动跳转",
+                                type="info",
+                            )
+                            ui.timer(1.5, lambda: do_rebind(new_port), once=True)
 
                         with ui.row():
                             ui.button("取消", on_click=dialog.close)
@@ -444,6 +549,7 @@ def build_page(console: WebConsole) -> None:
                 state_label = ui.label("")
                 urls_label = ui.label("").classes("text-sm font-mono")
                 countdown_label = ui.label("").classes("text-sm")
+                locked_label = ui.label("").classes("text-sm text-negative")
 
             refresh_tls_status()
 
@@ -488,6 +594,13 @@ def build_page(console: WebConsole) -> None:
             else ""
         )
 
+        locked = service.throttle.locked_accounts()
+        if locked:
+            items = "，".join(f"{k}（{int(v)}s）" for k, v in locked.items())
+            locked_label.set_text(f"登录已锁定：{items}")
+        else:
+            locked_label.set_text("")
+
         footer_label.set_text(
             f"用户 {db.count_users()} 个 · 共享目录 "
             f"{db.get_setting('share_dir', str(config_mod.default_share_dir()))}"
@@ -499,9 +612,102 @@ def build_page(console: WebConsole) -> None:
 
 
 # --------------------------------------------------------------------------
-# Web 后端（内部 uvicorn）
+# 换端口后的浏览器跳转
 # --------------------------------------------------------------------------
 
+
+def _redirect_js(new_port: int) -> str:
+    """换端口后让浏览器自己跟过去的脚本。
+
+    切换端口会立刻断开当前页面，所以先把脚本发下去，再执行切换。
+    脚本只探测**新端口**：握手成功才跳转，否则一直重试，
+    避免跳过去撞上「连接被拒绝」。
+    """
+    return f"""
+    (function () {{
+      const base = location.protocol + "//" + location.hostname + ":{new_port}";
+      const target = base + "{MOUNT_PATH}/";
+      let tries = 0;
+      function attempt() {{
+        tries += 1;
+        fetch(base + "/healthz", {{cache: "no-store", mode: "no-cors"}})
+          .then(function () {{ window.location.href = target; }})
+          .catch(function () {{
+            if (tries < 60) setTimeout(attempt, 500);
+          }});
+      }}
+      setTimeout(attempt, 1500);
+    }})();
+    """
+
+
+def build_login_page(console: WebConsole) -> None:
+    db = console.db
+    ui.page_title("登录 · ftpd 控制台")
+    ui.colors(primary="#1565c0")
+
+    with ui.column().classes("absolute-center items-center"):
+        with ui.card().classes("w-96"):
+            with ui.row().classes("items-center gap-2"):
+                ui.icon("lock").classes("text-2xl")
+                ui.label("ftpd 控制台").classes("text-lg font-semibold")
+            username = ui.input("用户名", value=db.admin_username()).classes("w-full")
+            password = ui.input(
+                "密码", password=True, password_toggle_button=True
+            ).classes("w-full")
+
+            def do_login() -> None:
+                ok, message = attempt_admin_login(
+                    console, username.value or "", password.value or "", client_ip()
+                )
+                if not ok:
+                    ui.notify(message, type="negative")
+                    return
+                app.storage.user["admin"] = db.admin_username()
+                ui.navigate.to("/")
+
+            password.on("keydown.enter", lambda _event: do_login())
+            ui.button("登录", icon="login", on_click=do_login).classes("w-full")
+
+
+def build_setup_page(console: WebConsole) -> None:
+    db = console.db
+    ui.page_title("初始化 · ftpd 控制台")
+    ui.colors(primary="#1565c0")
+
+    with ui.column().classes("absolute-center items-center"):
+        with ui.card().classes("w-[30rem]"):
+            ui.label("第一次使用，先设置管理员账号").classes("text-lg font-semibold")
+            ui.label(
+                "这个账号只用来登录 Web 控制台；FTP 用户是另一回事，"
+                "登录进来后在「用户」页添加。"
+            ).classes("text-xs opacity-70")
+            username = ui.input("管理员用户名", value="admin").classes("w-full")
+            password = ui.input(
+                "密码", password=True, password_toggle_button=True,
+                placeholder="至少 6 位",
+            ).classes("w-full")
+            confirm = ui.input("再输一次", password=True).classes("w-full")
+
+            def do_setup() -> None:
+                ok, message = create_admin(
+                    console, username.value or "", password.value or "",
+                    confirm.value or "",
+                )
+                if not ok:
+                    ui.notify(message, type="negative")
+                    return
+                app.storage.user["admin"] = db.admin_username()
+                ui.notify(message, type="positive")
+                ui.navigate.to("/")
+
+            ui.button("创建并进入", icon="check", on_click=do_setup).classes("w-full")
+
+
+
+# --------------------------------------------------------------------------
+# Web 后端（内部 uvicorn）
+# --------------------------------------------------------------------------
 class WebBackend:
     """在回环地址上跑 NiceGUI，供端口复用器转发。
 
@@ -518,6 +724,11 @@ class WebBackend:
 
     def _build_app(self) -> FastAPI:
         console = self.console
+        # NiceGUI 默认把会话存储写在 ./.nicegui，会污染仓库；挪到数据目录
+        storage_root = config_mod.data_dir() / "webgui"
+        storage_root.mkdir(parents=True, exist_ok=True)
+        app.storage.path = storage_root
+
         api = FastAPI(title="ftpd 控制台", docs_url=None, redoc_url=None)
 
         @api.get("/")
@@ -526,17 +737,44 @@ class WebBackend:
 
         @api.get("/healthz")
         async def _health() -> dict:
-            return {"ok": True, "ftp": console.service.ftp_enabled}
+            # 探针接口保持公开，但不泄露 FTP 运行状态
+            return {"ok": True}
 
         @ui.page("/")
-        def _index() -> None:
+        def _index():
+            redirect = login_redirect(console)
+            if redirect is not None:
+                return redirect
             build_page(console)
+            return None
+
+        @ui.page("/login")
+        def _login():
+            if not console.db.admin_exists():
+                return RedirectResponse(f"{MOUNT_PATH}/setup")
+            if app.storage.user.get("admin"):
+                return RedirectResponse(f"{MOUNT_PATH}/")
+            build_login_page(console)
+            return None
+
+        @ui.page("/setup")
+        def _setup():
+            if console.db.admin_exists():
+                return RedirectResponse(f"{MOUNT_PATH}/login")
+            build_setup_page(console)
+            return None
+
+        @ui.page("/logout")
+        def _logout():
+            app.storage.user.clear()
+            return RedirectResponse(f"{MOUNT_PATH}/login")
 
         ui.run_with(
             api,
             mount_path=MOUNT_PATH,
             title="ftpd 控制台",
             favicon="🔐",
+            storage_secret=console.db.session_secret(),
             show_welcome_message=False,
         )
         return api
@@ -553,6 +791,10 @@ class WebBackend:
         config = uvicorn.Config(
             self.app, host=host, port=port, log_level="warning", ws="auto",
             access_log=False,
+            # 前置的端口复用器会给每条连接注入 X-Forwarded-For，
+            # 它来自回环地址，所以只信任回环
+            proxy_headers=True,
+            forwarded_allow_ips="127.0.0.1",
         )
         self._server = uvicorn.Server(config)
         self.port = port

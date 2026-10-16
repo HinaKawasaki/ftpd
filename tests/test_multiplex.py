@@ -18,7 +18,13 @@ import time
 
 import pytest
 
-from ftpd.multiplex import classify_protocol, close_quietly, proxy_to
+from ftpd.multiplex import (
+    _inject_forwarded_for,
+    _read_http_head,
+    classify_protocol,
+    close_quietly,
+    proxy_to,
+)
 
 
 def _pair():
@@ -211,3 +217,44 @@ def test_proxy_to_reports_unreachable_backend():
         assert b"502" in client.recv(4096)
     finally:
         close_quietly(client)
+
+
+# --------------------------------------------------------------------------
+# X-Forwarded-For 注入（让 Web 后端看到真实客户端 IP）
+# --------------------------------------------------------------------------
+
+def test_inject_forwarded_for_adds_header():
+    raw = b"GET /webgui HTTP/1.1\r\nHost: x\r\n\r\n"
+    out = _inject_forwarded_for(raw, "192.168.1.7")
+    assert b"X-Forwarded-For: 192.168.1.7" in out
+    assert out.startswith(b"GET /webgui HTTP/1.1\r\n")
+    assert out.endswith(b"\r\n\r\n")
+
+
+def test_inject_forwarded_for_keeps_body():
+    raw = b"POST /x HTTP/1.1\r\nHost: x\r\n\r\nBODY"
+    out = _inject_forwarded_for(raw, "10.0.0.1")
+    assert out.endswith(b"\r\n\r\nBODY")
+    assert b"X-Forwarded-For: 10.0.0.1" in out
+
+
+def test_inject_forwarded_for_is_idempotent():
+    raw = b"GET / HTTP/1.1\r\nX-Forwarded-For: 1.2.3.4\r\n\r\n"
+    assert _inject_forwarded_for(raw, "10.0.0.7") == raw
+
+
+def test_inject_forwarded_for_leaves_partial_head_alone():
+    raw = b"GET / HTTP/1.1\r\nHost: x"
+    assert _inject_forwarded_for(raw, "10.0.0.7") == raw
+
+
+def test_read_http_head_reads_up_to_blank_line():
+    a, b = _pair()
+    try:
+        b.sendall(b"GET /win HTTP/1.1\r\nHost: x\r\n\r\nleftover")
+        head = _read_http_head(a, timeout=2.0)
+        assert head.startswith(b"GET /win")
+        assert b"\r\n\r\n" in head
+    finally:
+        close_quietly(a)
+        close_quietly(b)

@@ -22,6 +22,7 @@ from typing import List, Optional
 
 from . import config as config_mod
 from .db import UserDB
+from .multiplex import DEFAULT_GRACE
 from .server import FTPService, ServiceError
 from .webgui import LogBuffer, WebBackend, WebConsole
 
@@ -42,6 +43,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--host", default=config_mod.DEFAULT_HOST,
         help=f"监听地址（默认 {config_mod.DEFAULT_HOST}）",
+    )
+    parser.add_argument(
+        "--classify-grace", type=float, default=DEFAULT_GRACE,
+        help=(
+            "共用端口上判定协议时最多等首包多久（秒）。"
+            f"默认 {DEFAULT_GRACE:g}；调小可让 FTP 连接更快，"
+            "但太小时较慢的 HTTP 客户端可能被误判成 FTP"
+        ),
     )
     return parser.parse_args(argv)
 
@@ -65,7 +74,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 2) 共享端口
     port = int(args.port or db.get_setting("port", str(config_mod.DEFAULT_PORT)))
     try:
-        service.serve(port, http_target=("127.0.0.1", web_port), host=args.host)
+        service.serve(
+            port,
+            http_target=("127.0.0.1", web_port),
+            host=args.host,
+            classify_grace=args.classify_grace,
+        )
     except ServiceError as exc:
         print(f"启动失败：{exc}", file=sys.stderr)
         backend.stop()
@@ -74,6 +88,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     db.set_setting("port", str(port))
     logs.append("[启动] 共享端口就绪，FTP 默认处于停止状态")
+
+    if not db.admin_exists():
+        print("！还没有设置管理员密码：第一个打开控制台的人就能设置它。")
+        if args.host not in ("127.0.0.1", "localhost"):
+            print(f"！当前监听在 {args.host}，请尽快打开控制台完成初始化。")
+        print()
 
     print("ftpd 已启动。")
     print(f"  Web 控制台：http://<本机IP>:{port}{config_mod.__dict__.get('MOUNT_HINT', '/webgui')}")

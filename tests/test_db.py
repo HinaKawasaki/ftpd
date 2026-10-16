@@ -194,3 +194,54 @@ def test_database_persists_across_reopen(tmp_path):
         first.add_user("alice", "secret123")
     with UserDB(path) as second:
         assert second.verify("alice", "secret123") is True
+
+
+# --------------------------------------------------------------------------
+# 管理员凭据（Web 控制台登录用）
+# --------------------------------------------------------------------------
+
+def test_admin_not_set_initially(db: UserDB):
+    assert db.admin_exists() is False
+    assert db.admin_username() == "admin"
+    assert db.verify_admin("admin", "whatever") is False
+
+
+def test_set_and_verify_admin(db: UserDB):
+    db.set_admin("root", "adminpass1")
+    assert db.admin_exists() is True
+    assert db.admin_username() == "root"
+    assert db.verify_admin("root", "adminpass1") is True
+    assert db.verify_admin("root", "wrongpass") is False
+    assert db.verify_admin("someoneelse", "adminpass1") is False
+    assert db.admin_updated_at() is not None
+
+
+def test_admin_username_is_case_insensitive_and_trimmed(db: UserDB):
+    db.set_admin("Root", "adminpass1")
+    assert db.verify_admin("ROOT", "adminpass1") is True
+    assert db.verify_admin("  root  ", "adminpass1") is True
+
+
+def test_admin_password_is_never_plaintext(db: UserDB):
+    db.set_admin("root", "adminpass1")
+    stored = db.get_setting("admin_password_hash")
+    assert stored and "adminpass1" not in stored
+    assert stored.startswith("pbkdf2_sha256$")
+
+
+def test_admin_rejects_bad_input(db: UserDB):
+    with pytest.raises(ValidationError):
+        db.set_admin("root", "short")
+    with pytest.raises(ValidationError):
+        db.set_admin("bad name", "adminpass1")
+
+
+def test_session_secret_is_stable_per_database(db: UserDB, tmp_path):
+    first = db.session_secret()
+    assert len(first) > 20
+    assert db.session_secret() == first
+    other = UserDB(tmp_path / "other.db")
+    try:
+        assert other.session_secret() != first
+    finally:
+        other.close()

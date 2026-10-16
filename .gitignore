@@ -16,3 +16,6 @@ __pycache__/
 # 测试与工具缓存
 .pytest_cache/
 .coverage
+
+# NiceGUI 旧默认存储目录（现已改用应用数据目录）
+.nicegui/

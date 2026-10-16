@@ -444,3 +444,100 @@ def test_urls_mention_both_schemes(service, db, share, free_port):
 
     assert any(u.startswith("ftp://") for u in service.access_urls())
     assert all(u.endswith("/webgui") for u in service.web_urls())
+
+
+# --------------------------------------------------------------------------
+# 打磨：真实客户端 IP 与可配置的判定宽限期
+# --------------------------------------------------------------------------
+
+def start_capturing_http_backend(captured: dict) -> int:
+    """把收到的请求头记下来的极简后端。"""
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def run() -> None:
+        try:
+            conn, _ = server.accept()
+            captured["head"] = conn.recv(16384)
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                b"Connection: close\r\n\r\nOK"
+            )
+            conn.close()
+        finally:
+            server.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    return port
+
+
+def test_http_proxy_injects_x_forwarded_for(service, free_port):
+    captured: dict = {}
+    backend_port = start_capturing_http_backend(captured)
+    service.serve(free_port, http_target=("127.0.0.1", backend_port))
+
+    sock = socket.create_connection(("127.0.0.1", free_port), timeout=8)
+    try:
+        sock.sendall(b"GET /webgui HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        sock.recv(4096)
+    finally:
+        sock.close()
+
+    assert wait_for(lambda: "head" in captured, timeout=5), "后端没有收到请求"
+    assert b"X-Forwarded-For: 127.0.0.1" in captured["head"]
+
+
+def test_serve_rejects_negative_classify_grace(service, free_port):
+    with pytest.raises(ServiceError, match="宽限期"):
+        service.serve(free_port, classify_grace=-1)
+
+
+def test_classify_grace_is_honoured(service, free_port):
+    """沉默的连接要等满宽限期才被当成 FTP。"""
+    service.serve(free_port, classify_grace=0.05)
+    started = time.monotonic()
+    banner = read_banner(free_port)
+    elapsed = time.monotonic() - started
+    assert banner.startswith(b"421")
+    assert elapsed >= 0.04
+
+
+def test_rebind_keeps_classify_grace(service, db, share, free_port):
+    db.add_user("alice", "secret123")
+    service.serve(free_port, classify_grace=0.06)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        new_port = probe.getsockname()[1]
+    service.rebind(new_port)
+    assert service._classify_grace == 0.06
+
+
+def test_ftp_login_is_throttled(service, db, share, free_port):
+    """FTP 登录连续失败后要被临时锁住（防暴力破解）。"""
+    db.add_user("alice", "secret123")
+    service.serve(free_port)
+    service.enable(make_config(share))
+    assert wait_for(lambda: service.ftp_enabled)
+
+    for _ in range(5):  # 默认阈值就是 5 次
+        ftp = ftplib.FTP()
+        ftp.connect("127.0.0.1", free_port, timeout=10)
+        try:
+            with pytest.raises(ftplib.error_perm):
+                ftp.login("alice", "wrong")
+        finally:
+            ftp.close()
+
+    ftp = ftplib.FTP()
+    ftp.connect("127.0.0.1", free_port, timeout=10)
+    try:
+        with pytest.raises(ftplib.error_perm) as excinfo:
+            ftp.login("alice", "secret123")
+        assert "Too many failed attempts" in str(excinfo.value)
+    finally:
+        ftp.close()
+
+    assert service.throttle.locked_accounts(), "应该有被锁定的 key"

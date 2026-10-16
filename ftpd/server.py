@@ -41,7 +41,8 @@ from pyftpdlib.log import logger as pyftpdlib_logger
 
 from .auth import DBFTPAuthorizer
 from .db import UserDB
-from .multiplex import MultiplexedFTPServer
+from .multiplex import DEFAULT_GRACE, MultiplexedFTPServer
+from .security import LoginThrottle
 from .tls import cert_exists
 
 EventCallback = Callable[[str], None]
@@ -103,9 +104,16 @@ def local_ipv4_addresses() -> List[str]:
 class FTPService:
     """常驻前端 + 可开关的 FTP 服务。"""
 
-    def __init__(self, db: UserDB, on_event: Optional[EventCallback] = None) -> None:
+    def __init__(
+        self,
+        db: UserDB,
+        on_event: Optional[EventCallback] = None,
+        throttle: Optional[LoginThrottle] = None,
+    ) -> None:
         self.db = db
         self.on_event = on_event
+        #: FTP 登录失败计数；用户名与来源 IP 都会被记
+        self.throttle = throttle or LoginThrottle()
         self.config: Optional[ServerConfig] = None
 
         self._server: Optional[MultiplexedFTPServer] = None
@@ -120,6 +128,7 @@ class FTPService:
 
         self._port: Optional[int] = None
         self._http_target: Optional[Tuple[str, int]] = None
+        self._classify_grace = DEFAULT_GRACE
         self._ftp_enabled = False
 
         self._timer: Optional[threading.Timer] = None
@@ -188,7 +197,7 @@ class FTPService:
             pass
 
         _Placeholder.authorizer = DBFTPAuthorizer(
-            self.db, Path.home(), readonly=True
+            self.db, Path.home(), readonly=True, throttle=self.throttle
         )
         return _Placeholder
 
@@ -198,13 +207,20 @@ class FTPService:
         *,
         http_target: Optional[Tuple[str, int]] = None,
         host: str = "0.0.0.0",
+        classify_grace: float = DEFAULT_GRACE,
     ) -> None:
-        """占用共享端口，开始同时接待 FTP 与 Web 控制台。"""
+        """占用共享端口，开始同时接待 FTP 与 Web 控制台。
+
+        ``classify_grace`` 是判定协议时最多等首包多久：越小 FTP 连接越快，
+        但太小时慢一点的 HTTP 客户端可能被误判成 FTP。
+        """
         with self._lock:
             if self._server is not None:
                 raise ServiceError("前端已经在运行了")
             if not (1 <= int(port) <= 65535):
                 raise ServiceError(f"端口号必须在 1-65535 之间：{port}")
+            if classify_grace < 0:
+                raise ServiceError("首包判定宽限期不能为负数")
 
             try:
                 server = MultiplexedFTPServer(
@@ -212,6 +228,7 @@ class FTPService:
                     self._placeholder_handler(),
                     http_target=http_target,
                     on_event=self._emit,
+                    classify_grace=classify_grace,
                 )
             except OSError as exc:
                 raise ServiceError(f"无法监听 {host}:{port} —— {exc}") from exc
@@ -225,6 +242,7 @@ class FTPService:
             self._server = server
             self._port = int(port)
             self._http_target = http_target
+            self._classify_grace = classify_grace
             self._maintenance_task = server.ioloop.call_every(
                 MAINTENANCE_INTERVAL, self._maintenance
             )
@@ -254,8 +272,9 @@ class FTPService:
     def rebind(self, port: int) -> None:
         """换一个共享端口（Web 控制台地址会随之改变）。"""
         http_target = self._http_target
+        classify_grace = self._classify_grace
         self.shutdown()
-        self.serve(port, http_target=http_target)
+        self.serve(port, http_target=http_target, classify_grace=classify_grace)
 
     # ------------------------------------------------------------------
     # 维护任务（在 ioloop 线程里执行）
@@ -328,7 +347,9 @@ class FTPService:
         else:
             BaseHandler = FTPHandler  # type: ignore[assignment]
 
-        authorizer = DBFTPAuthorizer(self.db, cfg.directory, readonly=cfg.readonly)
+        authorizer = DBFTPAuthorizer(
+            self.db, cfg.directory, readonly=cfg.readonly, throttle=self.throttle
+        )
 
         class Handler(BaseHandler):  # type: ignore[misc, valid-type]
             def on_login(self, username: str) -> None:

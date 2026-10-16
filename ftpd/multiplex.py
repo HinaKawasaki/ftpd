@@ -93,6 +93,39 @@ def classify_protocol(sock: socket.socket, grace: float = DEFAULT_GRACE) -> str:
             pass
 
 
+def _read_http_head(sock: socket.socket, *, limit: int = 65536,
+                    timeout: float = 5.0) -> bytes:
+    """把客户端请求头读到 ``\r\n\r\n`` 为止（可能多读，多出的部分一并返回）。"""
+    previous = sock.gettimeout()
+    sock.settimeout(timeout)
+    buffer = b""
+    try:
+        while b"\r\n\r\n" not in buffer and len(buffer) < limit:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buffer += chunk
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.settimeout(previous)
+        except OSError:
+            pass
+    return buffer
+
+
+def _inject_forwarded_for(raw: bytes, client_ip: str) -> bytes:
+    """在请求头里插入 X-Forwarded-For；已经有就不重复插。"""
+    marker = raw.find(b"\r\n\r\n")
+    if marker < 0:
+        return raw
+    head, rest = raw[:marker], raw[marker:]
+    if b"x-forwarded-for" in head.lower():
+        return raw
+    return head + b"\r\nX-Forwarded-For: " + client_ip.encode("ascii", "replace") + rest
+
+
 def proxy_to(
     client: socket.socket,
     target: Target,
@@ -100,6 +133,7 @@ def proxy_to(
     connect_timeout: float = 5.0,
     idle_timeout: float = 120.0,
     on_event: Optional[EventCallback] = None,
+    client_ip: Optional[str] = None,
 ) -> None:
     """把一条已接受的连接原样转发给内部后端（用于 HTTP / WebSocket）。
 
@@ -129,6 +163,18 @@ def proxy_to(
             pass
         close_quietly(client)
         return
+
+    if client_ip:
+        # Web 后端看到的会是回环地址，所以把真实来源写进 X-Forwarded-For。
+        # 只处理每条连接的第一个请求（keep-alive 的后续请求拿不到，属已知限制）。
+        head = _read_http_head(client)
+        if head:
+            try:
+                upstream.sendall(_inject_forwarded_for(head, client_ip))
+            except OSError:
+                close_quietly(client)
+                close_quietly(upstream)
+                return
 
     for sock in (client, upstream):
         try:
@@ -266,7 +312,10 @@ class MultiplexedFTPServer(FTPServer):
         if kind == "http":
             if self.http_target:
                 # 不逐条记录 Web 访问，否则浏览器一开就把日志刷爆了
-                proxy_to(sock, self.http_target, on_event=self._emit)
+                proxy_to(
+                    sock, self.http_target, on_event=self._emit,
+                    client_ip=addr[0] if addr else None,
+                )
             else:
                 self._emit("收到 HTTP 连接，但没有启动 Web 后端")
                 self._reject(sock, "Web 控制台未启动")

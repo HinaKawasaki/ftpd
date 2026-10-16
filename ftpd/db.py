@@ -331,3 +331,47 @@ class UserDB:
         with self._lock:
             rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
         return {r["key"]: r["value"] for r in rows}
+
+    # -- 管理员（Web 控制台登录用） ---------------------------------------
+
+    ADMIN_USERNAME_KEY = "admin_username"
+    ADMIN_HASH_KEY = "admin_password_hash"
+    ADMIN_UPDATED_KEY = "admin_updated_at"
+    SESSION_SECRET_KEY = "session_secret"
+
+    def admin_exists(self) -> bool:
+        """是否已经设置过管理员密码。"""
+        return self.get_setting(self.ADMIN_HASH_KEY) is not None
+
+    def admin_username(self) -> str:
+        return self.get_setting(self.ADMIN_USERNAME_KEY, "admin") or "admin"
+
+    def admin_updated_at(self) -> Optional[str]:
+        return self.get_setting(self.ADMIN_UPDATED_KEY)
+
+    def set_admin(self, username: str, password: str) -> None:
+        """设置（或重置）管理员用户名与密码。"""
+        username = validate_username(username)
+        validate_password(password)
+        self.set_setting(self.ADMIN_USERNAME_KEY, username)
+        self.set_setting(self.ADMIN_HASH_KEY, hash_password(password))
+        self.set_setting(self.ADMIN_UPDATED_KEY, _now())
+
+    def verify_admin(self, username: str, password: str) -> bool:
+        """校验管理员凭据；用户名与密码都做常量时间比较。"""
+        stored = self.get_setting(self.ADMIN_HASH_KEY)
+        if not stored:
+            return False
+        expected = self.admin_username()
+        given = (username or "").strip()
+        user_ok = hmac.compare_digest(given.lower().encode(), expected.lower().encode())
+        pass_ok = verify_password(stored, password or "")
+        return user_ok and pass_ok
+
+    def session_secret(self) -> str:
+        """给 NiceGUI 会话签名用的密钥，首次调用时生成并持久化。"""
+        secret = self.get_setting(self.SESSION_SECRET_KEY)
+        if not secret:
+            secret = secrets.token_urlsafe(48)
+            self.set_setting(self.SESSION_SECRET_KEY, secret)
+        return secret
