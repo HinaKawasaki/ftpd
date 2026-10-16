@@ -197,8 +197,9 @@ ftpd/
 │   ├── multiplex.py  单端口协议复用：首包嗅探 / socket 交接 / HTTP 转发
 │   ├── webgui.py     NiceGUI 控制台（挂在 /webgui），含登录与内部 uvicorn 后端
 │   └── tls.py        自签证书生成
-├── tests/            134 个测试
+├── tests/            140 个测试
 ├── legacy/           封存的旧版 Kivy 桌面界面（仅存档，不再维护）
+├── tools/browser_check.py   用真实浏览器做端到端自检（开发用）
 ├── docs/screenshots/
 ├── setup.sh / run.sh
 └── requirements*.txt
@@ -220,9 +221,28 @@ ftpd/
 | `test_server.py` | 启停、端口释放、TLS、只读限制、**真实客户端 IP 不丢失**、事件循环线程真正退出、FTP 登录被限流 |
 | `test_webgui.py` | 端到端：同一端口上 `/webgui`、`/healthz`、FTP 登录并存，以及控制台鉴权跳转 |
 
+另外还有两条容易被忽略的回归测试：**慢的 Web 连接不能把 FTP 饿死**（分类线程池只做判定），
+以及**换端口失败时不能把现有服务一起关掉**。
+
 界面交互另外用 Playwright 驱动真实 Chrome 验证过全流程：
 首次访问落到初始化页 → 创建管理员 → 进入控制台 → 刷新会话保持 → 退出 → 错密码被拒 →
 正确密码登录 → 改端口后页面自动跳到新地址并可用。
+
+### 为什么还需要浏览器自检
+
+`build_page` 只在真实浏览器里执行，pytest 碰不到它——本项目已经**两次**出现
+「pytest 全绿、但打开控制台是 500」。所以留了一个脚本，用真实浏览器跑完整流程：
+
+```bash
+pip install playwright        # 不在项目依赖里
+python tools/browser_check.py --port 21310 --chrome /opt/google/chrome/google-chrome
+```
+
+它会走：初始化管理员 → 登录 → 界面加用户 → 启动 FTP → 用 FTP 客户端验证 →
+改端口 → 确认页面自动跳转且 **FTP 仍在运行**。
+
+（脚本里程序化填值后要留一点时间让 NiceGUI 把值同步到服务端，否则点击时服务端还是旧值——
+这是测试脚本的细节，不是应用行为。）
 
 ## 已知限制
 
@@ -251,3 +271,5 @@ ftpd/
 * 2025-05-24 ~ 05-26：最初的 34 行匿名只读 FTP 分享脚本（10 个提交）。
 * 第一次重构：SQLite 用户管理 + Web 控制台 + 单端口协议复用 + 修复上述 bug 1、2。
 * 第二次推进：控制台鉴权与登录限流 + 真实客户端 IP + 可配置判定宽限期 + 改端口自动跳转。
+
+<!-- probe -->

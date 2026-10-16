@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+from ftpd.multiplex import close_quietly
 from ftpd.server import FTPService, ServerConfig, ServiceError, local_ipv4_addresses
 from ftpd.tls import generate_self_signed_cert
 
@@ -541,3 +542,150 @@ def test_ftp_login_is_throttled(service, db, share, free_port):
         ftp.close()
 
     assert service.throttle.locked_accounts(), "应该有被锁定的 key"
+
+
+# --------------------------------------------------------------------------
+# 回归：慢的 Web 连接不能把 FTP 饿死
+# --------------------------------------------------------------------------
+
+def start_hanging_backend():
+    """一个只接受连接、永不响应的后端：HTTP 连接会一直挂着。"""
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(16)
+    held = []
+
+    def run() -> None:
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            held.append(conn)  # 收下就不管
+
+    threading.Thread(target=run, daemon=True).start()
+    return server, server.getsockname()[1], held
+
+
+def test_slow_web_connections_do_not_starve_ftp(service, db, share, free_port):
+    """分类线程池只该做「判定」这一小步。
+
+    如果转发也跑在池里，几条长期挂着的 Web 连接就会占满 worker，
+    后面的 FTP 连接连问候语都拿不到。
+    """
+    backend, hang_port, held = start_hanging_backend()
+    try:
+        service.serve(
+            free_port,
+            http_target=("127.0.0.1", hang_port),
+            classify_grace=0.02,
+            max_classifiers=2,      # 故意开得很小
+        )
+        db.add_user("alice", "secret123")
+        service.enable(make_config(share))
+        assert wait_for(lambda: service.ftp_enabled)
+
+        clients = []
+        try:
+            for _ in range(3):      # 超过 worker 数量
+                sock = socket.create_connection(("127.0.0.1", free_port), timeout=5)
+                sock.sendall(b"GET /hang HTTP/1.1\r\nHost: x\r\n\r\n")
+                clients.append(sock)
+
+            # 必须确认这些 Web 连接真的占到了 worker，否则测试会空转通过
+            assert wait_for(lambda: len(held) >= 2, timeout=8), (
+                f"挂起后端只收到 {len(held)} 条连接，测试前提不成立"
+            )
+
+            # FTP 仍然必须能连上并登录
+            ftp = ftplib.FTP()
+            ftp.connect("127.0.0.1", free_port, timeout=8)
+            try:
+                ftp.login("alice", "secret123")
+                assert ftp.nlst() == ["hello.txt"]
+            finally:
+                ftp.quit()
+        finally:
+            for sock in clients:
+                close_quietly(sock)
+    finally:
+        for conn in held:
+            close_quietly(conn)
+        backend.close()
+
+
+def test_rebind_refuses_unavailable_port(service, db, share, free_port):
+    """新端口不可用时要原地失败，不能把现有服务关掉。"""
+    db.add_user("alice", "secret123")
+    service.serve(free_port)
+    service.enable(make_config(share))
+    assert wait_for(lambda: service.ftp_enabled)
+
+    blocker = socket.socket()
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    taken = blocker.getsockname()[1]
+    try:
+        with pytest.raises(ServiceError, match="不可用"):
+            service.rebind(taken)
+    finally:
+        blocker.close()
+
+    # 原服务必须完好无损
+    assert service.running is True
+    assert service.port == free_port
+    ftp = connect_ftp(free_port)
+    try:
+        assert ftp.nlst() == ["hello.txt"]
+    finally:
+        ftp.quit()
+
+
+def test_rebind_keeps_ftp_running(service, db, share, free_port):
+    """换端口不该把 FTP 顺手停掉。"""
+    db.add_user("alice", "secret123")
+    service.serve(free_port)
+    service.enable(make_config(share))
+    assert wait_for(lambda: service.ftp_enabled)
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        new_port = probe.getsockname()[1]
+
+    service.rebind(new_port)
+    assert service.port == new_port
+    assert wait_for(lambda: service.ftp_enabled), "换端口后 FTP 应当仍在运行"
+
+    ftp = connect_ftp(new_port)
+    try:
+        assert ftp.nlst() == ["hello.txt"]
+    finally:
+        ftp.quit()
+
+
+def test_shutdown_closes_proxied_connections(service, free_port):
+    """转发中的 Web 连接不在 ioloop 里，关服务时必须一起收掉。"""
+    backend, hang_port, held = start_hanging_backend()
+    client = None
+    try:
+        service.serve(free_port, http_target=("127.0.0.1", hang_port))
+        client = socket.create_connection(("127.0.0.1", free_port), timeout=5)
+        client.sendall(b"GET /hang HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert wait_for(lambda: len(held) >= 1, timeout=8), "连接没被转发过去"
+
+        service.shutdown()
+        client.settimeout(5)
+        closed = False
+        try:
+            closed = client.recv(4096) == b""
+        except OSError:
+            closed = True
+        assert closed, "关闭服务后，被转发的连接也应当被关闭"
+    finally:
+        if client is not None:
+            close_quietly(client)
+        for conn in held:
+            close_quietly(conn)
+        backend.close()

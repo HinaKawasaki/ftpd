@@ -41,7 +41,12 @@ from pyftpdlib.log import logger as pyftpdlib_logger
 
 from .auth import DBFTPAuthorizer
 from .db import UserDB
-from .multiplex import DEFAULT_GRACE, MultiplexedFTPServer
+from .multiplex import (
+    DEFAULT_GRACE,
+    DEFAULT_MAX_CLASSIFIERS,
+    DEFAULT_MAX_PROXIES,
+    MultiplexedFTPServer,
+)
 from .security import LoginThrottle
 from .tls import cert_exists
 
@@ -129,6 +134,9 @@ class FTPService:
         self._port: Optional[int] = None
         self._http_target: Optional[Tuple[str, int]] = None
         self._classify_grace = DEFAULT_GRACE
+        self._host = "0.0.0.0"
+        self._max_classifiers = DEFAULT_MAX_CLASSIFIERS
+        self._max_proxies = DEFAULT_MAX_PROXIES
         self._ftp_enabled = False
 
         self._timer: Optional[threading.Timer] = None
@@ -208,6 +216,8 @@ class FTPService:
         http_target: Optional[Tuple[str, int]] = None,
         host: str = "0.0.0.0",
         classify_grace: float = DEFAULT_GRACE,
+        max_classifiers: int = DEFAULT_MAX_CLASSIFIERS,
+        max_proxies: int = DEFAULT_MAX_PROXIES,
     ) -> None:
         """占用共享端口，开始同时接待 FTP 与 Web 控制台。
 
@@ -229,6 +239,8 @@ class FTPService:
                     http_target=http_target,
                     on_event=self._emit,
                     classify_grace=classify_grace,
+                    max_classifiers=max_classifiers,
+                    max_proxies=max_proxies,
                 )
             except OSError as exc:
                 raise ServiceError(f"无法监听 {host}:{port} —— {exc}") from exc
@@ -243,6 +255,9 @@ class FTPService:
             self._port = int(port)
             self._http_target = http_target
             self._classify_grace = classify_grace
+            self._host = host
+            self._max_classifiers = max_classifiers
+            self._max_proxies = max_proxies
             self._maintenance_task = server.ioloop.call_every(
                 MAINTENANCE_INTERVAL, self._maintenance
             )
@@ -271,10 +286,48 @@ class FTPService:
 
     def rebind(self, port: int) -> None:
         """换一个共享端口（Web 控制台地址会随之改变）。"""
-        http_target = self._http_target
-        classify_grace = self._classify_grace
+        with self._lock:
+            if self._server is None:
+                raise ServiceError("前端还没启动，无法切换端口")
+            http_target = self._http_target
+            classify_grace = self._classify_grace
+            max_classifiers = self._max_classifiers
+            max_proxies = self._max_proxies
+            host = self._host
+            was_enabled = self._ftp_enabled
+            config = self.config
+
+        # 先确认新端口能用，免得关掉旧端口之后才发现绑不上（那样就没入口了）
+        self._probe_port(host, port)
+
         self.shutdown()
-        self.serve(port, http_target=http_target, classify_grace=classify_grace)
+        self.serve(
+            port,
+            http_target=http_target,
+            host=host,
+            classify_grace=classify_grace,
+            max_classifiers=max_classifiers,
+            max_proxies=max_proxies,
+        )
+
+        if was_enabled and config is not None:
+            # 换端口不该把 FTP 顺带停掉
+            self.enable(config)
+            self._emit("FTP 服务已在新端口上继续运行")
+
+    @staticmethod
+    def _probe_port(host: str, port: int) -> None:
+        """试绑一下端口，不可用就抛 ServiceError（不动现有服务）。"""
+        if not (1 <= int(port) <= 65535):
+            raise ServiceError(f"端口号必须在 1-65535 之间：{port}")
+        probe = socket.socket()
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((host, int(port)))
+        except OSError as exc:
+            raise ServiceError(f"端口 {port} 不可用：{exc}") from exc
+        finally:
+            probe.close()
 
     # ------------------------------------------------------------------
     # 维护任务（在 ioloop 线程里执行）

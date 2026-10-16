@@ -422,7 +422,7 @@ def build_page(console: WebConsole) -> None:
                     )
                 tls_status_label = ui.label("").classes("text-xs")
 
-                def collect_config() -> ServerConfig:
+                def collect_config() -> Tuple[ServerConfig, int]:
                     directory_text = (directory_input.value or "").strip()
                     directory = (
                         Path(directory_text).expanduser()

@@ -54,6 +54,8 @@ DEFAULT_GRACE = 0.15
 PUMP_INTERVAL = 0.03
 #: 同时进行协议判定的连接数上限
 DEFAULT_MAX_CLASSIFIERS = 32
+#: 同时转发的 Web 连接数上限
+DEFAULT_MAX_PROXIES = 256
 
 
 def close_quietly(sock: socket.socket) -> None:
@@ -265,6 +267,7 @@ class MultiplexedFTPServer(FTPServer):
         on_event: Optional[EventCallback] = None,
         classify_grace: float = DEFAULT_GRACE,
         max_classifiers: int = DEFAULT_MAX_CLASSIFIERS,
+        max_proxies: int = DEFAULT_MAX_PROXIES,
     ) -> None:
         super().__init__(address, handler)
         self.http_target = http_target
@@ -276,6 +279,12 @@ class MultiplexedFTPServer(FTPServer):
         self._pool = ThreadPoolExecutor(
             max_workers=max_classifiers, thread_name_prefix="ftpd-classify"
         )
+        # 转发是「一条连接一个线程、活到连接结束」，不能放进分类线程池，
+        # 否则几条挂着不动的 Web 连接就能占满 worker、把 FTP 饿死。
+        self._proxy_slots = threading.BoundedSemaphore(max(1, int(max_proxies)))
+        # 转发中的连接不在 ioloop 的 socket_map 里，关闭时要自己收
+        self._proxy_socks: set = set()
+        self._proxy_lock = threading.Lock()
         self._closed = threading.Event()
         # 在事件循环线程里定期排空注入队列
         self._pump_task = self.ioloop.call_every(PUMP_INTERVAL, self._pump)
@@ -312,10 +321,7 @@ class MultiplexedFTPServer(FTPServer):
         if kind == "http":
             if self.http_target:
                 # 不逐条记录 Web 访问，否则浏览器一开就把日志刷爆了
-                proxy_to(
-                    sock, self.http_target, on_event=self._emit,
-                    client_ip=addr[0] if addr else None,
-                )
+                self._start_proxy(sock, addr)
             else:
                 self._emit("收到 HTTP 连接，但没有启动 Web 后端")
                 self._reject(sock, "Web 控制台未启动")
@@ -331,6 +337,33 @@ class MultiplexedFTPServer(FTPServer):
             )
             return
         self._inject.put((sock, addr))
+
+    def _start_proxy(self, sock: socket.socket, addr) -> None:
+        """把 HTTP 连接的转发交给独立线程，立刻还回分类线程池的 worker。
+
+        ``proxy_to`` 会一直跑到连接结束（WebSocket 可能是几十分钟），
+        所以绝不能占用分类线程池。
+        """
+        if not self._proxy_slots.acquire(blocking=False):
+            self._emit("并发 Web 连接过多，已拒绝一条新连接")
+            self._reject(sock, "503 Service Unavailable")
+            return
+
+        target = self.http_target
+        client_ip = addr[0] if addr else None
+
+        def run() -> None:
+            try:
+                proxy_to(sock, target, on_event=self._emit, client_ip=client_ip)
+            finally:
+                with self._proxy_lock:
+                    self._proxy_socks.discard(sock)
+                self._proxy_slots.release()
+
+        with self._proxy_lock:
+            self._proxy_socks.add(sock)
+
+        threading.Thread(target=run, name="ftpd-proxy", daemon=True).start()
 
     def _reject(self, sock: socket.socket, message: str) -> None:
         if not message.endswith("\r\n"):
@@ -349,6 +382,14 @@ class MultiplexedFTPServer(FTPServer):
                 sock, addr = self._inject.get_nowait()
             except queue.Empty:
                 return
+            if not self.ftp_enabled:
+                # 判定期间服务可能被停用，这里再确认一次
+                self._reject(
+                    sock,
+                    "421 FTP service is currently disabled. "
+                    "Open the web console at /webgui to enable it.",
+                )
+                continue
             try:
                 FTPServer.handle_accepted(self, sock, addr)
             except Exception as exc:  # pragma: no cover - 兜底
@@ -360,6 +401,12 @@ class MultiplexedFTPServer(FTPServer):
     def shutdown_extra(self) -> None:
         """释放线程池与定时任务（在 ioloop 关闭之后调用）。"""
         self._closed.set()
+        # 转发中的连接不归 ioloop 管，必须在这里关掉
+        with self._proxy_lock:
+            pending = list(self._proxy_socks)
+            self._proxy_socks.clear()
+        for sock in pending:
+            close_quietly(sock)
         try:
             if self._pump_task is not None:
                 self._pump_task.cancel()

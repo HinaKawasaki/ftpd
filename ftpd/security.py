@@ -20,6 +20,10 @@ DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_WINDOW = 300.0
 #: 触发后的锁定时长（秒）
 DEFAULT_LOCKOUT = 900.0
+#: 每累计这么多次失败就全表清扫一次，避免大量无效 key 长期占内存
+SWEEP_EVERY = 256
+#: 最多同时跟踪多少个 key，防止被「换用户名刷」撑爆内存
+DEFAULT_MAX_TRACKED = 10_000
 
 
 def attempt_keys(username: str, ip: str | None) -> Tuple[str, ...]:
@@ -43,15 +47,18 @@ class LoginThrottle:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         window: float = DEFAULT_WINDOW,
         lockout: float = DEFAULT_LOCKOUT,
+        max_tracked: int = DEFAULT_MAX_TRACKED,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.max_attempts = max(1, int(max_attempts))
         self.window = float(window)
         self.lockout = float(lockout)
+        self.max_tracked = max(16, int(max_tracked))
         self._clock = clock
         self._failures: Dict[str, Deque[float]] = defaultdict(deque)
         self._locked_until: Dict[str, float] = {}
         self._lock = threading.RLock()
+        self._since_sweep = 0
 
     # -- 内部 -------------------------------------------------------------
 
@@ -93,6 +100,33 @@ class LoginThrottle:
                 if len(queue) >= self.max_attempts:
                     self._locked_until[key] = now + self.lockout
                     queue.clear()
+            # 攻击者换着用户名试时会留下大量空 key，定期清一清
+            self._since_sweep += 1
+            if self._since_sweep >= SWEEP_EVERY:
+                self._since_sweep = 0
+                self._sweep(now)
+            # 真的被刷爆时，先按窗口清理，仍然超限就丢掉最旧的记录
+            if len(self._failures) > self.max_tracked:
+                self._sweep(now)
+            if len(self._failures) > self.max_tracked:
+                self._evict_oldest(len(self._failures) - self.max_tracked)
+
+    def _sweep(self, now: float) -> None:
+        for key in list(self._failures):
+            self._purge(key, now)
+            if not self._failures.get(key):
+                self._failures.pop(key, None)
+
+    def _evict_oldest(self, count: int) -> None:
+        """丢掉最旧的失败记录；已被锁定的 key 不动（那是正在生效的防护）。"""
+        candidates = [
+            (key, queue[-1] if queue else 0.0)
+            for key, queue in self._failures.items()
+            if key not in self._locked_until
+        ]
+        candidates.sort(key=lambda item: item[1])
+        for key, _ in candidates[:max(0, count)]:
+            self._failures.pop(key, None)
 
     def record_success(self, keys: Iterable[str]) -> None:
         with self._lock:

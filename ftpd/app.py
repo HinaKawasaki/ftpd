@@ -95,7 +95,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"！当前监听在 {args.host}，请尽快打开控制台完成初始化。")
         print()
 
-    print("ftpd 已启动。")
+    print("ftpd 已启动。", flush=True)
     print(f"  Web 控制台：http://<本机IP>:{port}{config_mod.__dict__.get('MOUNT_HINT', '/webgui')}")
     print(f"  FTP 登录  ：ftp://<本机IP>:{port}   （先到控制台添加用户并启动 FTP）")
     print(f"  数据库    ：{db_file}")

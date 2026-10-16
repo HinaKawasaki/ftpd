@@ -142,3 +142,29 @@ def test_thread_safety_smoke():
     for t in threads:
         t.join()
     assert throttle.lock_remaining(keys) == 0.0  # 还没到 1000 次
+
+
+# --------------------------------------------------------------------------
+# 内存保护
+# --------------------------------------------------------------------------
+
+def test_tracked_keys_are_capped():
+    """被「换用户名刷」时，计数表不能无限膨胀。"""
+    throttle = LoginThrottle(max_attempts=5, window=3600, lockout=60, max_tracked=100)
+    for i in range(500):
+        throttle.record_failure((f"user:flood-{i}",))
+    assert len(throttle._failures) <= 100
+
+
+def test_eviction_keeps_active_locks():
+    """丢弃旧记录时，正在生效的锁定不能被丢掉。"""
+    throttle = LoginThrottle(max_attempts=2, window=3600, lockout=600, max_tracked=8)
+    # 先把 alice 锁上
+    throttle.record_failure(("user:alice",))
+    throttle.record_failure(("user:alice",))
+    assert throttle.lock_remaining(("user:alice",)) > 0
+
+    for i in range(100):
+        throttle.record_failure((f"user:flood-{i}",))
+
+    assert throttle.lock_remaining(("user:alice",)) > 0, "锁定不该被挤掉"
