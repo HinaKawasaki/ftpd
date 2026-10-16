@@ -360,9 +360,29 @@ class MultiplexedFTPServer(FTPServer):
     # -- 接收：只做分派，判定交给线程池 -----------------------------------
 
     def handle_accepted(self, sock, addr):  # noqa: D102 - 覆盖 pyftpdlib 钩子
+        if self.http_target is None and self.https_target is None:
+            # 这个端口只服务 FTP（端口已经和 Web 分开了），不需要判定协议：
+            # 直接在事件循环里交接，连线程池都不进，也没有任何等待。
+            self._adopt(sock, addr)
+            return
         try:
             self._pool.submit(self._classify_and_route, sock, addr)
         except RuntimeError:  # 线程池已关闭
+            close_quietly(sock)
+
+    def _adopt(self, sock: socket.socket, addr) -> None:
+        """把一个连接直接交给 pyftpdlib（必须运行在事件循环线程里）。"""
+        if not self.ftp_enabled:
+            self._reject(
+                sock,
+                "421 FTP service is currently disabled. "
+                "Open the web console to enable it.",
+            )
+            return
+        try:
+            FTPServer.handle_accepted(self, sock, addr)
+        except Exception as exc:  # pragma: no cover - 兜底
+            self._emit(f"接管 FTP 连接失败：{exc!r}")
             close_quietly(sock)
 
     def _classify_and_route(self, sock: socket.socket, addr) -> None:
@@ -481,19 +501,8 @@ class MultiplexedFTPServer(FTPServer):
                 sock, addr = self._inject.get_nowait()
             except queue.Empty:
                 return
-            if not self.ftp_enabled:
-                # 判定期间服务可能被停用，这里再确认一次
-                self._reject(
-                    sock,
-                    "421 FTP service is currently disabled. "
-                    "Open the web console at /webgui to enable it.",
-                )
-                continue
-            try:
-                FTPServer.handle_accepted(self, sock, addr)
-            except Exception as exc:  # pragma: no cover - 兜底
-                self._emit(f"接管 FTP 连接失败：{exc!r}")
-                close_quietly(sock)
+            # 判定期间服务可能被停用，_adopt 里会再确认一次
+            self._adopt(sock, addr)
 
     # -- 关闭 -------------------------------------------------------------
 

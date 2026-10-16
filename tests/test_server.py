@@ -437,14 +437,14 @@ def test_tls_login_and_download(service, db, share, free_port, tmp_path):
         ftps.quit()
 
 
-def test_urls_mention_both_schemes(service, db, share, free_port):
+def test_ftp_access_urls(service, db, share, free_port):
     db.add_user("alice", "secret123")
     service.serve(free_port)
     service.enable(make_config(share))
     assert wait_for(lambda: service.ftp_enabled)
 
-    assert any(u.startswith("ftp://") for u in service.access_urls())
-    assert all(u.endswith("/webgui") for u in service.web_urls())
+    urls = service.access_urls()
+    assert urls and all(u.startswith("ftp://") for u in urls)
 
 
 # --------------------------------------------------------------------------
@@ -721,11 +721,46 @@ def test_late_but_within_grace_http_is_classified_as_http(service, free_port):
 
 
 def test_silent_connection_is_classified_as_ftp_within_grace(service, free_port):
-    """沉默的连接在宽限期后被当成 FTP，且不应再多等一截。"""
-    service.serve(free_port, classify_grace=0.2)
+    """共用端口模式（有 Web 后端）下，沉默的连接在宽限期后被当成 FTP。"""
+    backend_port = start_http_backend()
+    service.serve(
+        free_port, http_target=("127.0.0.1", backend_port), classify_grace=0.2
+    )
     started = time.monotonic()
     banner = read_banner(free_port)
     elapsed = time.monotonic() - started
 
     assert banner.startswith(b"421")
     assert 0.19 <= elapsed <= 0.35, f"等待时间异常：{elapsed:.3f}s"
+
+
+# --------------------------------------------------------------------------
+# FTP 专用端口：不做协议判定
+# --------------------------------------------------------------------------
+
+def test_ftp_only_port_skips_classification(service, free_port):
+    """没有 Web 后端时不该判定协议：宽限期设得再大也立刻应答。
+
+    这正是「FTP 与 Web 分成两个端口」的核心收益。
+    """
+    service.serve(free_port, classify_grace=5.0)   # 故意设得很大
+    started = time.monotonic()
+    banner = read_banner(free_port)
+    elapsed = time.monotonic() - started
+
+    assert banner.startswith(b"421")
+    assert elapsed < 0.5, f"应当零等待，实际 {elapsed:.3f}s"
+
+
+def test_ftp_only_port_serves_ftp_without_delay(service, db, share, free_port):
+    """真的登录一次，确认没有判定环节也能正常工作。"""
+    db.add_user("alice", "secret123")
+    service.serve(free_port, classify_grace=5.0)
+    service.enable(make_config(share))
+    assert wait_for(lambda: service.ftp_enabled)
+
+    ftp = connect_ftp(free_port)
+    try:
+        assert ftp.nlst() == ["hello.txt"]
+    finally:
+        ftp.quit()

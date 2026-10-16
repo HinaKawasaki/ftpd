@@ -16,7 +16,10 @@ from pathlib import Path
 APP_NAME = "ftpd"
 
 DEFAULT_HOST = "0.0.0.0"
+#: FTP 端口
 DEFAULT_PORT = 2121
+#: Web 控制台端口（默认与 FTP 分开）
+DEFAULT_WEB_PORT = 2122
 
 #: 用户不指定时，默认共享整个家目录
 def default_share_dir() -> Path:

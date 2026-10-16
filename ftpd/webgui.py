@@ -31,6 +31,7 @@ from nicegui import app, ui
 
 from . import config as config_mod
 from .db import UserDB, ValidationError
+from .net import local_ipv4_addresses
 from .security import LoginThrottle, attempt_keys
 from .server import FTPService, ServerConfig, ServiceError
 from .tls import TLSError, cert_exists, generate_self_signed_cert
@@ -92,6 +93,11 @@ class WebConsole:
         self.setup_token: Optional[str] = None
         #: 由 app 层回填，便于在界面上重启 HTTPS 后端
         self.backend: Optional["WebBackend"] = None
+        #: 控制台对外的端口与协议（由 app 层按运行模式回填）
+        self.web_port: Optional[int] = None
+        self.web_https: bool = False
+        #: 是否共用一个端口（由 app 层按启动参数回填）
+        self.shared_port: bool = False
 
 
 def _format_duration(seconds: float) -> str:
@@ -134,6 +140,15 @@ def attempt_admin_login(
 
     console.admin_throttle.record_success(keys)
     return True, "登录成功"
+
+
+def console_urls(console: "WebConsole") -> List[str]:
+    """控制台的对外地址。端口与协议由 app 层回填。"""
+    if not console.web_port:
+        return []
+    hosts = local_ipv4_addresses() or ["<本机IP>"]
+    scheme = "https" if console.web_https else "http"
+    return [f"{scheme}://{host}:{console.web_port}{MOUNT_PATH}" for host in hosts]
 
 
 def is_loopback(ip: Optional[str]) -> bool:
@@ -258,6 +273,12 @@ def build_page(console: WebConsole) -> None:
 
     def set_port(value: int) -> None:
         db.set_setting("port", str(int(value)))
+
+    def current_web_port() -> int:
+        return int(db.get_setting("web_port", str(config_mod.DEFAULT_WEB_PORT)))
+
+    def set_web_port(value: int) -> None:
+        db.set_setting("web_port", str(int(value)))
 
     # ---------------- 日志 ----------------
     def build_logs_panel() -> None:
@@ -425,14 +446,25 @@ def build_page(console: WebConsole) -> None:
                 ).classes("w-full")
                 with ui.row().classes("items-end"):
                     port_input = ui.number(
-                        "共享端口", value=current_port(), min=1, max=65535,
+                        "FTP 端口", value=current_port(), min=1, max=65535,
                         precision=0, format="%d",
                     ).classes("w-40")
+                    web_port_input = ui.number(
+                        "Web 控制台端口（改后需重启）",
+                        value=current_web_port(), min=1, max=65535,
+                        precision=0, format="%d",
+                    ).classes("w-56")
                     autostop_input = ui.number(
                         "自动停止 FTP（分钟，0=不自动停）",
                         value=float(db.get_setting("auto_stop_minutes", "0")),
                         min=0, precision=1,
                     ).classes("w-64")
+
+                if console.shared_port:
+                    ui.label(
+                        "当前是「共用端口」模式：FTP 与控制台在同一个端口上，"
+                        "Web 控制台端口这一项不生效。"
+                    ).classes("text-xs opacity-70")
 
                 readonly_switch = ui.switch(
                     "只读模式（FTP 用户只能下载）",
@@ -483,7 +515,7 @@ def build_page(console: WebConsole) -> None:
                         return
                     if port != service.port:
                         ui.notify(
-                            f"共享端口是 {service.port}，改端口请用「应用端口」按钮",
+                            f"当前 FTP 端口是 {service.port}，要换请用「应用 FTP 端口」",
                             type="warning",
                         )
                         return
@@ -502,6 +534,20 @@ def build_page(console: WebConsole) -> None:
                     service.disable()
                     ui.notify("已请求停止 FTP 服务", type="info")
 
+                def save_web_port() -> None:
+                    try:
+                        value = int(web_port_input.value or 0)
+                    except (TypeError, ValueError):
+                        ui.notify("端口号必须是整数", type="negative")
+                        return
+                    if not (1 <= value <= 65535):
+                        ui.notify("端口号必须在 1-65535 之间", type="negative")
+                        return
+                    set_web_port(value)
+                    ui.notify(
+                        f"Web 控制台端口已保存为 {value}，重启后生效", type="positive"
+                    )
+
                 def apply_port() -> None:
                     try:
                         new_port = int(port_input.value or 0)
@@ -513,6 +559,15 @@ def build_page(console: WebConsole) -> None:
                         ui.notify("端口没有变化", type="info")
                         return
                     set_port(new_port)
+                    if not console.shared_port:
+                        # 端口分开：换 FTP 端口不影响控制台，直接切就行
+                        try:
+                            service.rebind(new_port)
+                        except ServiceError as exc:
+                            ui.notify(f"切换失败：{exc}", type="negative")
+                            return
+                        ui.notify(f"FTP 端口已切到 {new_port}", type="positive")
+                        return
                     with ui.dialog() as dialog, ui.card():
                         ui.label(
                             f"将把共享端口从 {old_port} 切到 {new_port}。"
@@ -588,8 +643,10 @@ def build_page(console: WebConsole) -> None:
                 with ui.row():
                     ui.button("启动 FTP", icon="play_arrow", on_click=start_ftp)
                     ui.button("停止 FTP", icon="stop", color="grey", on_click=stop_ftp)
-                    ui.button("应用端口", icon="swap_horiz", color="warning",
+                    ui.button("应用 FTP 端口", icon="swap_horiz", color="warning",
                               on_click=apply_port)
+                    ui.button("保存 Web 端口", icon="save", color="grey",
+                              on_click=save_web_port)
 
             with ui.card().classes("w-full"):
                 ui.label("运行状态").classes("text-base font-semibold")
@@ -614,7 +671,7 @@ def build_page(console: WebConsole) -> None:
         port = service.port
 
         if not running:
-            header_status.set_text("共享端口未运行")
+            header_status.set_text("端口未运行")
         elif ftp_on:
             header_status.set_text(f"FTP 运行中 · 端口 {port}")
         else:
@@ -626,7 +683,7 @@ def build_page(console: WebConsole) -> None:
             state_label.set_text("FTP 服务：已停止（可在上方启动）")
 
         urls = service.access_urls() if ftp_on else []
-        web = service.web_urls()
+        web = console_urls(console)
         lines = []
         if urls:
             lines.append("FTP 地址：" + "    ".join(urls))
@@ -641,11 +698,17 @@ def build_page(console: WebConsole) -> None:
             else ""
         )
 
-        console_scheme_label.set_text(
-            "控制台协议：HTTPS（明文请求会 301 跳转）"
-            if service.https_available
-            else "控制台协议：HTTP（未启用 HTTPS，可用 --no-console-tls 之外的方式开启）"
-        )
+        if console.web_https:
+            detail = (
+                "明文请求会 301 跳转"
+                if console.shared_port
+                else "控制台端口只接受 https://"
+            )
+            console_scheme_label.set_text(f"控制台协议：HTTPS（{detail}）")
+        else:
+            console_scheme_label.set_text(
+                "控制台协议：HTTP（未启用 HTTPS，启动时不加 --no-console-tls 即可开启）"
+            )
 
         locked = service.throttle.locked_accounts()
         if locked:
@@ -844,14 +907,20 @@ class WebBackend:
         )
         return api
 
-    def _serve_one(self, *, certfile=None, keyfile=None):
-        """起一个内部 uvicorn，返回 (server, thread, port)。"""
-        with socket.socket() as probe:
-            probe.bind((self.host, 0))
-            port = int(probe.getsockname()[1])
+    def _serve_one(self, *, certfile=None, keyfile=None, port=None, host=None):
+        """起一个 uvicorn，返回 (server, thread, port)。
+
+        ``port`` 为 None 时在回环上挑一个空闲端口（共用端口模式，
+        由协议复用器转过来）；给了端口就直接绑上去（端口分开模式）。
+        """
+        host = host or self.host
+        if port is None:
+            with socket.socket() as probe:
+                probe.bind((host, 0))
+                port = int(probe.getsockname()[1])
 
         config = uvicorn.Config(
-            self.app, host=self.host, port=port, log_level="warning", ws="auto",
+            self.app, host=host, port=port, log_level="warning", ws="auto",
             access_log=False,
             # 前置的端口复用器会给每条连接注入 X-Forwarded-For，
             # 它来自回环地址，所以只信任回环
@@ -882,8 +951,18 @@ class WebBackend:
         if thread.is_alive():
             thread.join(timeout=5)
 
-    def start(self, host: str = "127.0.0.1", *, certfile=None, keyfile=None):
-        """启动内部 Web 服务，返回 (明文端口或 None, HTTPS 端口或 None)。
+    def start(
+        self,
+        host: str = "127.0.0.1",
+        *,
+        port: Optional[int] = None,
+        certfile=None,
+        keyfile=None,
+    ):
+        """启动 Web 服务，返回 (明文端口或 None, HTTPS 端口或 None)。
+
+        * ``port=None``：绑回环上的空闲端口，供协议复用器转发（共用一个端口）；
+        * ``port=2122``：直接绑到该端口对外服务（FTP 与 Web 分开）。
 
         **只会起一个后端**：有证书就走 HTTPS，没有就走明文。
 
@@ -896,16 +975,16 @@ class WebBackend:
         self.host = host
 
         if certfile and keyfile:
-            port = self.start_https(certfile, keyfile)
-            if port is not None:
-                return None, port
+            https_port = self.start_https(certfile, keyfile, port=port)
+            if https_port is not None:
+                return None, https_port
             self.console.logs.append("[警告] HTTPS 后端起不来，退回明文 HTTP")
 
-        server, thread, self.http_port = self._serve_one()
+        server, thread, self.http_port = self._serve_one(port=port)
         self._http = (server, thread)
         return self.http_port, None
 
-    def start_https(self, certfile, keyfile) -> Optional[int]:
+    def start_https(self, certfile, keyfile, *, port=None) -> Optional[int]:
         """启动 HTTPS 后端；失败只记日志。
 
         如果明文后端已经在跑，这里直接拒绝——一个 NiceGUI 应用不能同时挂两个事件循环。
@@ -919,16 +998,16 @@ class WebBackend:
         self._https = None
         self.https_port = None
         try:
-            server, thread, port = self._serve_one(
-                certfile=certfile, keyfile=keyfile
+            server, thread, bound = self._serve_one(
+                certfile=certfile, keyfile=keyfile, port=port
             )
         except Exception as exc:  # pragma: no cover - 证书坏了之类
             self.console.logs.append(f"[警告] HTTPS 后端启动失败：{exc}")
             return None
         self._https = (server, thread)
-        self.https_port = port
+        self.https_port = bound
         self.certfile, self.keyfile = Path(certfile), Path(keyfile)
-        return port
+        return bound
 
     def restart_https(self, certfile, keyfile) -> Optional[int]:
         """换证书后重启 HTTPS 后端；本来没跑 HTTPS 就什么都不做。"""

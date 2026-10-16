@@ -29,7 +29,7 @@ from .db import UserDB
 from .multiplex import DEFAULT_GRACE
 from .server import FTPService, ServiceError
 from .tls import TLSError, cert_exists, generate_self_signed_cert
-from .webgui import MOUNT_PATH, LogBuffer, WebBackend, WebConsole
+from .webgui import LogBuffer, WebBackend, WebConsole, console_urls
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -43,7 +43,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--port", type=int, default=None,
-        help=f"共享端口（默认取上次保存的设置，初始 {config_mod.DEFAULT_PORT}）",
+        help=f"FTP 端口（默认取上次保存的设置，初始 {config_mod.DEFAULT_PORT}）",
+    )
+    parser.add_argument(
+        "--web-port", type=int, default=None,
+        help=(
+            "Web 控制台端口（默认取上次保存的设置，初始 "
+            f"{config_mod.DEFAULT_WEB_PORT}）"
+        ),
+    )
+    parser.add_argument(
+        "--shared-port", action="store_true",
+        help=(
+            "把 FTP 和 Web 控制台放回同一个端口（靠首包嗅探分流）。"
+            "默认是两个端口；共用时 FTP 连接要多等一小会儿用于判定协议"
+        ),
     )
     parser.add_argument(
         "--host", default=config_mod.DEFAULT_HOST,
@@ -101,21 +115,42 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.no_console_tls:
         certfile, keyfile = _prepare_certificate(logs)
 
+    port = int(args.port or db.get_setting("port", str(config_mod.DEFAULT_PORT)))
+    web_port = int(
+        args.web_port or db.get_setting("web_port", str(config_mod.DEFAULT_WEB_PORT))
+    )
+
     backend = WebBackend(console)
     console.backend = backend
-    http_port, https_port = backend.start(certfile=certfile, keyfile=keyfile)
+    if args.shared_port:
+        http_port, https_port = backend.start(
+            host="127.0.0.1", certfile=certfile, keyfile=keyfile
+        )
+    else:
+        http_port, https_port = backend.start(
+            host=args.host, port=web_port, certfile=certfile, keyfile=keyfile
+        )
     logs.append(
         "[启动] Web 后端就绪："
         + (f"HTTPS {https_port}" if https_port else f"明文 HTTP {http_port}")
     )
 
-    port = int(args.port or db.get_setting("port", str(config_mod.DEFAULT_PORT)))
-
     try:
+        if args.shared_port:
+            # 共用一个端口：Web 后端留在回环上，由协议复用器转发
+            http_target = ("127.0.0.1", http_port) if http_port else None
+            https_target = ("127.0.0.1", https_port) if https_port else None
+            console.web_port = port
+        else:
+            # 端口分开：FTP 端口只做 FTP，完全不需要判定协议
+            http_target = https_target = None
+            console.web_port = web_port
+        console.web_https = bool(https_port)
+        console.shared_port = bool(args.shared_port)
         service.serve(
             port,
-            http_target=("127.0.0.1", http_port) if http_port else None,
-            https_target=("127.0.0.1", https_port) if https_port else None,
+            http_target=http_target,
+            https_target=https_target,
             host=args.host,
             classify_grace=args.classify_grace,
             adaptive_grace=args.adaptive_grace,
@@ -127,18 +162,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     db.set_setting("port", str(port))
-    logs.append("[启动] 共享端口就绪，FTP 默认处于停止状态")
+    db.set_setting("web_port", str(web_port))
+    logs.append("[启动] 端口就绪，FTP 默认处于停止状态")
 
     print("ftpd 已启动。", flush=True)
-    for url in service.web_urls():
+    for url in console_urls(console):
         suffix = "（自签证书，浏览器会提示不受信任）" if url.startswith("https") else ""
         print(f"  Web 控制台：{url}{suffix}")
-    print(f"  FTP 登录  ：ftp://<本机IP>:{port}   （先到控制台添加用户并启动 FTP）")
+    for url in service.access_urls():
+        print(f"  FTP 登录  ：{url}   （先到控制台添加用户并启动 FTP）")
     print(f"  数据库    ：{db_file}")
-    print(
-        "  控制台策略："
-        + ("HTTPS（明文请求会 301 跳转）" if https_port else "HTTP（未启用 HTTPS）")
-    )
+    if not https_port:
+        console_policy = "HTTP（未启用 HTTPS）"
+    elif args.shared_port:
+        console_policy = "HTTPS（共用端口，明文请求会 301 跳转）"
+    else:
+        console_policy = "HTTPS（控制台端口只接受 https://）"
+    print(f"  控制台策略：{console_policy}")
     print()
 
     if not db.admin_exists():

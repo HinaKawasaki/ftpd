@@ -182,3 +182,23 @@ def test_is_loopback():
     assert is_loopback("::1") is True
     assert is_loopback("192.168.1.5") is False
     assert is_loopback(None) is False
+
+
+# --------------------------------------------------------------------------
+# 控制台对外地址
+# --------------------------------------------------------------------------
+
+def test_console_urls(console):
+    from ftpd.webgui import console_urls
+
+    console.web_port = None
+    assert console_urls(console) == []
+
+    console.web_port = 2122
+    console.web_https = False
+    plain = console_urls(console)
+    assert plain and all(u.startswith("http://") for u in plain)
+    assert all(u.endswith("/webgui") for u in plain)
+
+    console.web_https = True
+    assert all(u.startswith("https://") for u in console_urls(console))

@@ -7,10 +7,11 @@
 依赖 Playwright（不在 requirements 里）：
 
     pip install playwright
-    python tools/browser_check.py --port 21310 --chrome /opt/google/chrome/google-chrome
+    python tools/browser_check.py --port 21310 --web-port 21311 \
+        --chrome /opt/google/chrome/google-chrome
 
 它会：初始化管理员 → 登录 → 界面加用户 → 启动 FTP → 用 FTP 客户端验证 →
-改端口 → 确认页面自动跳转且 FTP 仍在运行。
+改 FTP 端口 → 确认控制台**没有**被带跑、且 FTP 在新端口上可用。
 """
 
 from __future__ import annotations
@@ -39,9 +40,22 @@ ADMIN_USER, ADMIN_PASS = "root", "adminpass1"
 FTP_USER, FTP_PASS = "alice", "secret123"
 
 
-def open_and_wait(
-    page, url: str, selector: str, *, attempts: int = 5, timeout: int = 15_000
-) -> None:
+def ftp_roundtrip(port: int, expect_file: str) -> str:
+    ftp = ftplib.FTP()
+    ftp.connect("127.0.0.1", port, timeout=10)
+    try:
+        ftp.login(FTP_USER, FTP_PASS)
+        names = ftp.nlst()
+        assert expect_file in names, f"{expect_file} 不在 {names}"
+        buffer = io.BytesIO()
+        ftp.retrbinary(f"RETR {expect_file}", buffer.write)
+        return buffer.getvalue().decode()
+    finally:
+        ftp.quit()
+
+
+def open_and_wait(page, url: str, selector: str, *, attempts: int = 5,
+                  timeout: int = 15_000) -> None:
     """打开页面并等到指定内容出现，失败就整页重来。
 
     NiceGUI 的内容是靠 WebSocket 推下来的，而这台机器的回环转发层偶发抽风
@@ -86,23 +100,10 @@ def wait_for(page, selector: str, *, attempts: int = 4, timeout: int = 15_000) -
     raise last_error
 
 
-def ftp_roundtrip(port: int, expect_file: str) -> str:
-    ftp = ftplib.FTP()
-    ftp.connect("127.0.0.1", port, timeout=10)
-    try:
-        ftp.login(FTP_USER, FTP_PASS)
-        names = ftp.nlst()
-        assert expect_file in names, f"{expect_file} 不在 {names}"
-        buffer = io.BytesIO()
-        ftp.retrbinary(f"RETR {expect_file}", buffer.write)
-        return buffer.getvalue().decode()
-    finally:
-        ftp.quit()
-
-
-def run(port: int, new_port: int, chrome: str, keep_shots: Path | None) -> int:
-    # 控制台默认强制 HTTPS，而且是自签证书，所以要忽略证书错误
-    base = f"https://127.0.0.1:{port}/webgui/"
+def run(ftp_port: int, web_port: int, new_ftp_port: int, chrome: str,
+        keep_shots: Path | None) -> int:
+    # 控制台默认是 HTTPS，而且是自签证书，所以要忽略证书错误
+    base = f"https://127.0.0.1:{web_port}/webgui/"
     share = Path(tempfile.mkdtemp(prefix="ftpd-browser-"))
     (share / "readme.txt").write_text("hello ftp\n", encoding="utf-8")
 
@@ -126,7 +127,7 @@ def run(port: int, new_port: int, chrome: str, keep_shots: Path | None) -> int:
         # 程序化填值后要留点时间让 NiceGUI 把值同步到服务端，否则点击时服务端还是旧值
         page.wait_for_timeout(800)
         page.get_by_role("button", name="创建并进入").click()
-        page.wait_for_selector("text=添加用户", timeout=30_000)
+        wait_for(page, "text=添加用户")
         print("   进入控制台 ✅")
 
         print("2) 界面添加 FTP 用户")
@@ -137,41 +138,37 @@ def run(port: int, new_port: int, chrome: str, keep_shots: Path | None) -> int:
         wait_for(page, f"text={FTP_USER}")
         print("   用户已添加 ✅")
 
-        print("3) 启动 FTP 并验证")
+        print("3) 启动 FTP 并验证（FTP 与 Web 是两个端口）")
         page.locator("div.q-tab:has-text('服务')").click()
-        wait_for(page, "text=共享端口")
+        wait_for(page, "text=FTP 端口")
         page.get_by_label("共享目录（FTP 用户看到的根目录）").fill(str(share))
         page.wait_for_timeout(800)
         page.get_by_role("button", name="启动 FTP").click()
         wait_for(page, "text=FTP 服务：运行中")
         time.sleep(1)
-        assert ftp_roundtrip(port, "readme.txt").strip() == "hello ftp"
-        print(f"   端口 {port} 上 FTP 可用 ✅")
+        assert ftp_roundtrip(ftp_port, "readme.txt").strip() == "hello ftp"
+        print(f"   FTP 端口 {ftp_port} 可用 ✅")
 
-        print(f"4) 切换到端口 {new_port}，页面应自动跳转")
-        page.get_by_label("共享端口").fill(str(new_port))
+        print(f"4) 把 FTP 端口改到 {new_ftp_port}（控制台不应被带跑）")
+        page.get_by_label("FTP 端口").fill(str(new_ftp_port))
         page.wait_for_timeout(800)
-        page.get_by_role("button", name="应用端口").click()
-        page.wait_for_timeout(500)
-        page.get_by_role("button", name="切换").click()
-        page.wait_for_url(f"**{new_port}**", timeout=45_000)
-        wait_for(page, "text=添加用户")
-        print(f"   已跳到 {new_port} ✅")
+        page.get_by_role("button", name="应用 FTP 端口").click()
+        time.sleep(2)
+        assert f":{web_port}" in page.url, f"控制台不该跳走，现在在 {page.url}"
+        wait_for(page, "text=FTP 服务：运行中")
+        print(f"   控制台仍在 {page.url} ✅")
 
         if keep_shots:
             keep_shots.mkdir(parents=True, exist_ok=True)
-            page.locator("div.q-tab:has-text('服务')").click()
-            # 等面板真的切换过去再截图，否则拍到的还是上一个标签页
-            page.wait_for_selector("text=运行状态", timeout=15_000)
             page.wait_for_timeout(600)
             page.screenshot(path=str(keep_shots / "service.png"))
             print(f"   截图 → {keep_shots / 'service.png'}")
 
         browser.close()
 
-    print("5) 换端口后 FTP 应仍在运行")
-    assert ftp_roundtrip(new_port, "readme.txt").strip() == "hello ftp"
-    print(f"   端口 {new_port} 上 FTP 仍可用 ✅")
+    print(f"5) 新 FTP 端口 {new_ftp_port} 上应仍可用")
+    assert ftp_roundtrip(new_ftp_port, "readme.txt").strip() == "hello ftp"
+    print(f"   端口 {new_ftp_port} 上 FTP 可用 ✅")
 
     print("\n全部通过")
     return 0
@@ -179,13 +176,18 @@ def run(port: int, new_port: int, chrome: str, keep_shots: Path | None) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="用真实浏览器自检 Web 控制台")
-    parser.add_argument("--port", type=int, default=21310)
-    parser.add_argument("--new-port", type=int, default=None)
+    parser.add_argument("--port", type=int, default=21310, help="FTP 端口")
+    parser.add_argument("--web-port", type=int, default=None, help="Web 控制台端口")
+    parser.add_argument("--new-port", type=int, default=None, help="改成的 FTP 端口")
     parser.add_argument("--chrome", default="/opt/google/chrome/google-chrome")
     parser.add_argument("--screenshots", default=None, help="可选：截图输出目录")
     args = parser.parse_args()
+
+    ftp_port = args.port
+    web_port = args.web_port or ftp_port + 1
+    new_ftp_port = args.new_port or ftp_port + 2
     shots = Path(args.screenshots) if args.screenshots else None
-    return run(args.port, args.new_port or args.port + 1, args.chrome, shots)
+    return run(ftp_port, web_port, new_ftp_port, args.chrome, shots)
 
 
 if __name__ == "__main__":

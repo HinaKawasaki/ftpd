@@ -169,28 +169,6 @@ class FTPService:
         hosts = local_ipv4_addresses() or ["<本机IP>"]
         return [f"{self._scheme()}://{h}:{self._port}" for h in hosts]
 
-    def web_urls(self) -> List[str]:
-        """Web 控制台地址；HTTPS 可用时排在前面。"""
-        if not self._port:
-            return []
-        hosts = local_ipv4_addresses() or ["<本机IP>"]
-        urls: List[str] = []
-        if self._https_target:
-            urls += [f"https://{h}:{self._port}/webgui" for h in hosts]
-        if self._http_target:
-            urls += [f"http://{h}:{self._port}/webgui" for h in hosts]
-        return urls
-
-    @property
-    def https_available(self) -> bool:
-        """HTTPS 后端是否在跑。"""
-        return self._https_target is not None
-
-    @property
-    def tls_required(self) -> bool:
-        """控制台是否只走 HTTPS（即没有明文后端，明文会被 301 跳走）。"""
-        return self._https_target is not None and self._http_target is None
-
     def set_web_targets(
         self,
         http_target: Optional[Tuple[str, int]],
