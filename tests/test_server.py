@@ -689,3 +689,43 @@ def test_shutdown_closes_proxied_connections(service, free_port):
         for conn in held:
             close_quietly(conn)
         backend.close()
+
+
+# --------------------------------------------------------------------------
+# 协议判定的宽限期：边界行为
+# --------------------------------------------------------------------------
+
+def test_adaptive_grace_is_off_by_default(service, free_port):
+    """RTT 自适应默认关闭——中间有代理时它会读错那一跳。"""
+    service.serve(free_port)
+    assert service._server.adaptive_grace is False
+
+
+def test_late_but_within_grace_http_is_classified_as_http(service, free_port):
+    """只要在宽限期内把请求发出来，就应当被正确识别成 HTTP。"""
+    captured: dict = {}
+    backend_port = start_capturing_http_backend(captured)
+    service.serve(
+        free_port, http_target=("127.0.0.1", backend_port), classify_grace=0.4
+    )
+
+    client = socket.create_connection(("127.0.0.1", free_port), timeout=8)
+    try:
+        time.sleep(0.1)      # 故意晚一点发，但仍远小于宽限期
+        client.sendall(b"GET /webgui HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        client.settimeout(6)
+        assert client.recv(64).startswith(b"HTTP/1.1 200")
+    finally:
+        close_quietly(client)
+    assert captured.get("head", b"").startswith(b"GET /webgui")
+
+
+def test_silent_connection_is_classified_as_ftp_within_grace(service, free_port):
+    """沉默的连接在宽限期后被当成 FTP，且不应再多等一截。"""
+    service.serve(free_port, classify_grace=0.2)
+    started = time.monotonic()
+    banner = read_banner(free_port)
+    elapsed = time.monotonic() - started
+
+    assert banner.startswith(b"421")
+    assert 0.19 <= elapsed <= 0.35, f"等待时间异常：{elapsed:.3f}s"

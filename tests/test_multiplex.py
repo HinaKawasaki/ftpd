@@ -296,3 +296,40 @@ def test_request_parsing_is_forgiving():
     assert request_path(b"junk") == "/"
     assert request_host(b"junk") == ""
     assert request_path(b"") == "/"
+
+
+# --------------------------------------------------------------------------
+# 自适应宽限期（默认关闭，见 net.adaptive_classify_grace 的说明）
+# --------------------------------------------------------------------------
+
+def test_adaptive_grace_follows_kernel_rtt(monkeypatch):
+    from ftpd import net
+
+    monkeypatch.setattr(net, "connection_rtt", lambda sock: 0.001)  # 1ms
+    grace = net.adaptive_classify_grace(None, ceiling=0.15)
+    assert 0.007 <= grace <= 0.011          # 3ms + 5ms margin
+
+
+def test_adaptive_grace_falls_back_to_ceiling(monkeypatch):
+    from ftpd import net
+
+    monkeypatch.setattr(net, "connection_rtt", lambda sock: None)
+    assert net.adaptive_classify_grace(None, ceiling=0.15) == 0.15
+
+
+def test_adaptive_grace_never_exceeds_ceiling(monkeypatch):
+    from ftpd import net
+
+    monkeypatch.setattr(net, "connection_rtt", lambda sock: 1.0)    # 1 秒
+    assert net.adaptive_classify_grace(None, ceiling=0.15) == 0.15
+
+
+def test_connection_rtt_is_none_for_non_tcp():
+    a, b = _pair()   # AF_UNIX socketpair：没有 TCP_INFO
+    try:
+        from ftpd.net import connection_rtt
+
+        assert connection_rtt(a) is None
+    finally:
+        close_quietly(a)
+        close_quietly(b)

@@ -52,9 +52,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--classify-grace", type=float, default=DEFAULT_GRACE,
         help=(
-            "共用端口上判定协议时最多等首包多久（秒）。"
-            f"默认 {DEFAULT_GRACE:g}；调小可让 FTP 连接更快，"
-            "但太小时较慢的 HTTP 客户端可能被误判成 FTP"
+            "共用端口上判定协议时最多等首包多久（秒），自适应模式下的上限。"
+            f"默认 {DEFAULT_GRACE:g}；太小时较慢的 HTTP 客户端可能被误判成 FTP"
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-grace", action="store_true",
+        help=(
+            "按连接 RTT 自适应缩短判定等待（默认关闭）。"
+            "能让直连场景下的 FTP 连接快很多，但**中间有代理/转发层时会误判**——"
+            "那里读到的 RTT 只是到代理的那一跳"
         ),
     )
     parser.add_argument(
@@ -111,6 +118,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             https_target=("127.0.0.1", https_port) if https_port else None,
             host=args.host,
             classify_grace=args.classify_grace,
+            adaptive_grace=args.adaptive_grace,
         )
     except ServiceError as exc:
         print(f"启动失败：{exc}", file=sys.stderr)

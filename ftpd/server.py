@@ -52,7 +52,11 @@ from .tls import cert_exists
 
 EventCallback = Callable[[str], None]
 
-POLL_INTERVAL = 0.5
+#: 事件循环的轮询粒度（秒）。
+#: pyftpdlib 的 poll() 会把超时原封不动交给 OS、**不会**为调度任务缩短
+#: （ioloop.py 里的 poll 实现），所以这个值同时也是「注入队列最久多久被处理」：
+#: 调大了，FTP 连接就会在判定完之后还干等一截。0.02 只是每秒 50 次空转，可以忽略。
+POLL_INTERVAL = 0.02
 JOIN_TIMEOUT = 5.0
 MAINTENANCE_INTERVAL = 0.1
 
@@ -122,6 +126,7 @@ class FTPService:
         self._http_target: Optional[Tuple[str, int]] = None
         self._https_target: Optional[Tuple[str, int]] = None
         self._classify_grace = DEFAULT_GRACE
+        self._adaptive_grace = False
         self._host = "0.0.0.0"
         self._max_classifiers = DEFAULT_MAX_CLASSIFIERS
         self._max_proxies = DEFAULT_MAX_PROXIES
@@ -234,6 +239,7 @@ class FTPService:
         https_target: Optional[Tuple[str, int]] = None,
         host: str = "0.0.0.0",
         classify_grace: float = DEFAULT_GRACE,
+        adaptive_grace: bool = False,
         max_classifiers: int = DEFAULT_MAX_CLASSIFIERS,
         max_proxies: int = DEFAULT_MAX_PROXIES,
     ) -> None:
@@ -258,6 +264,7 @@ class FTPService:
                     https_target=https_target,
                     on_event=self._emit,
                     classify_grace=classify_grace,
+                    adaptive_grace=adaptive_grace,
                     max_classifiers=max_classifiers,
                     max_proxies=max_proxies,
                 )
@@ -275,6 +282,7 @@ class FTPService:
             self._http_target = http_target
             self._https_target = https_target
             self._classify_grace = classify_grace
+            self._adaptive_grace = adaptive_grace
             self._host = host
             self._max_classifiers = max_classifiers
             self._max_proxies = max_proxies
@@ -314,6 +322,7 @@ class FTPService:
             http_target = self._http_target
             https_target = self._https_target
             classify_grace = self._classify_grace
+            adaptive_grace = self._adaptive_grace
             max_classifiers = self._max_classifiers
             max_proxies = self._max_proxies
             host = self._host
@@ -330,6 +339,7 @@ class FTPService:
             https_target=https_target,
             host=host,
             classify_grace=classify_grace,
+            adaptive_grace=adaptive_grace,
             max_classifiers=max_classifiers,
             max_proxies=max_proxies,
         )

@@ -39,6 +39,8 @@ from typing import Callable, Optional, Tuple
 
 from pyftpdlib.servers import FTPServer
 
+from .net import adaptive_classify_grace
+
 EventCallback = Callable[[str], None]
 Target = Tuple[str, int]
 
@@ -315,6 +317,7 @@ class MultiplexedFTPServer(FTPServer):
         https_target: Optional[Target] = None,
         on_event: Optional[EventCallback] = None,
         classify_grace: float = DEFAULT_GRACE,
+        adaptive_grace: bool = False,
         max_classifiers: int = DEFAULT_MAX_CLASSIFIERS,
         max_proxies: int = DEFAULT_MAX_PROXIES,
     ) -> None:
@@ -322,7 +325,13 @@ class MultiplexedFTPServer(FTPServer):
         self.http_target = http_target
         self.https_target = https_target
         self.on_event = on_event
+        #: 判定协议时最多等多久（自适应模式下的上限）
         self.classify_grace = classify_grace
+        #: 按连接实际 RTT 缩短等待。默认**关闭**：
+        #: 这个值来自本端 socket，只在本端能直接看到客户端时才代表真实往返；
+        #: 中间有代理/转发层时它测的是「到代理」的那一跳，会严重偏小，
+        #: 结果是把真实 HTTP 请求误判成 FTP（实测复现过）。
+        self.adaptive_grace = adaptive_grace
         self.ftp_enabled = True
 
         self._inject: "queue.Queue[Tuple[socket.socket, tuple]]" = queue.Queue()
@@ -357,8 +366,14 @@ class MultiplexedFTPServer(FTPServer):
             close_quietly(sock)
 
     def _classify_and_route(self, sock: socket.socket, addr) -> None:
+        grace = self.classify_grace
+        if self.adaptive_grace:
+            # 局域网 RTT 只有几十微秒，等待可以压到几毫秒；
+            # 公网则自动放宽，不会因为客户端慢而误判成 FTP。
+            grace = adaptive_classify_grace(sock, ceiling=self.classify_grace)
+
         try:
-            kind = classify_protocol(sock, self.classify_grace)
+            kind = classify_protocol(sock, grace)
         except Exception as exc:  # pragma: no cover - 兜底
             self._emit(f"协议判定失败：{exc!r}")
             close_quietly(sock)
