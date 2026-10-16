@@ -1,0 +1,213 @@
+"""协议嗅探与转发的单元测试。
+
+这台机器的回环 TCP 上有一层转发（客户端本地端口 55794，服务端 accept
+到的却是 55802），并且**先开始等待的阻塞读取不会被后来的数据唤醒**。
+因此这里刻意不写「客户端先连、稍后再发、服务端阻塞等」这类合成用例 ——
+那种前提在本机不成立，会稳定误报。
+
+转发路径的真实覆盖放在 tests/test_server.py 里：
+``test_http_is_routed_to_the_web_backend`` 与
+``test_ftp_and_http_share_the_same_port`` 走的是生产代码路径。
+"""
+
+from __future__ import annotations
+
+import socket
+import threading
+import time
+
+import pytest
+
+from ftpd.multiplex import classify_protocol, close_quietly, proxy_to
+
+
+def _pair():
+    a, b = socket.socketpair()
+    return a, b
+
+
+# --------------------------------------------------------------------------
+# 协议嗅探
+# --------------------------------------------------------------------------
+
+def test_http_request_is_detected():
+    a, b = _pair()
+    try:
+        b.sendall(b"GET /webgui HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert classify_protocol(a, 0.3) == "http"
+        # 窥探不能消费数据
+        assert a.recv(4) == b"GET "
+    finally:
+        close_quietly(a)
+        close_quietly(b)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"POST /x HTTP/1.1\r\n", b"HEAD / HTTP/1.0\r\n", b"PRI * HTTP/2.0\r\n"],
+)
+def test_various_http_methods(payload):
+    a, b = _pair()
+    try:
+        b.sendall(payload)
+        assert classify_protocol(a, 0.3) == "http"
+    finally:
+        close_quietly(a)
+        close_quietly(b)
+
+
+def test_pipelined_ftp_command_is_detected_as_ftp():
+    a, b = _pair()
+    try:
+        b.sendall(b"USER alice\r\n")
+        assert classify_protocol(a, 0.3) == "ftp"
+    finally:
+        close_quietly(a)
+        close_quietly(b)
+
+
+def test_silent_peer_is_treated_as_ftp():
+    """FTP 客户端会等服务器先发问候语，所以沉默就是 FTP。"""
+    a, b = _pair()
+    try:
+        started = time.monotonic()
+        assert classify_protocol(a, 0.15) == "ftp"
+        assert time.monotonic() - started >= 0.14
+    finally:
+        close_quietly(a)
+        close_quietly(b)
+
+
+def test_closed_peer_is_reported():
+    a, b = _pair()
+    b.close()
+    try:
+        assert classify_protocol(a, 0.3) == "closed"
+    finally:
+        close_quietly(a)
+
+
+def test_classify_restores_blocking_mode():
+    a, b = _pair()
+    try:
+        a.setblocking(True)
+        classify_protocol(a, 0.05)
+        assert a.gettimeout() is None
+    finally:
+        close_quietly(a)
+        close_quietly(b)
+
+
+# --------------------------------------------------------------------------
+# 转发
+# --------------------------------------------------------------------------
+
+def _start_echo_backend() -> int:
+    """一个收到什么就回什么的 TCP 后端。"""
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def run() -> None:
+        try:
+            conn, _ = server.accept()
+            data = conn.recv(64)
+            conn.sendall(b"PONG:" + data)
+            conn.close()
+        finally:
+            server.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    return port
+
+
+def _start_front(backend_port: int):
+    """一个只接受一条连接、随后交给 proxy_to 的前端。"""
+    front = socket.socket()
+    front.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    front.bind(("127.0.0.1", 0))
+    front.listen(1)
+    front_port = front.getsockname()[1]
+
+    def run() -> None:
+        try:
+            conn, _ = front.accept()
+            proxy_to(conn, ("127.0.0.1", backend_port))
+        finally:
+            front.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    return front_port
+
+
+def test_proxy_to_handles_large_payload():
+    """来回各 256 KB，确认分片与背压都正常。"""
+    payload = bytes(range(256)) * 1024  # 256 KB
+
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    backend_port = server.getsockname()[1]
+
+    def backend() -> None:
+        try:
+            conn, _ = server.accept()
+            received = b""
+            while len(received) < len(payload):
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                received += chunk
+            conn.sendall(received)  # 原样送回
+            conn.close()
+        finally:
+            server.close()
+
+    threading.Thread(target=backend, daemon=True).start()
+    front_port = _start_front(backend_port)
+
+    client = socket.create_connection(("127.0.0.1", front_port), timeout=20)
+    client.settimeout(20)
+    try:
+        client.sendall(payload)
+        echoed = b""
+        while len(echoed) < len(payload):
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            echoed += chunk
+        assert echoed == payload
+    finally:
+        close_quietly(client)
+
+
+def test_proxy_to_reports_unreachable_backend():
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()
+
+    front = socket.socket()
+    front.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    front.bind(("127.0.0.1", 0))
+    front.listen(1)
+    front_port = front.getsockname()[1]
+
+    def run() -> None:
+        try:
+            conn, _ = front.accept()
+            proxy_to(conn, ("127.0.0.1", dead_port))
+        finally:
+            front.close()
+
+    threading.Thread(target=run, daemon=True).start()
+
+    client = socket.create_connection(("127.0.0.1", front_port), timeout=8)
+    client.settimeout(8)
+    try:
+        assert b"502" in client.recv(4096)
+    finally:
+        close_quietly(client)

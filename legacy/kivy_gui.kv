@@ -1,0 +1,234 @@
+#:import dp kivy.metrics.dp
+
+<RootWidget>:
+    orientation: 'vertical'
+
+    TabbedPanel:
+        id: tabs
+        do_default_tab: False
+
+        # ============================ 用户管理 ============================
+        TabbedPanelItem:
+            text: '用户'
+            BoxLayout:
+                orientation: 'vertical'
+                padding: dp(14)
+                spacing: dp(10)
+
+                GridLayout:
+                    cols: 2
+                    size_hint_y: None
+                    height: dp(92)
+                    spacing: dp(8)
+                    Label:
+                        text: '用户名'
+                        size_hint_x: 0.22
+                        halign: 'left'
+                        text_size: self.size
+                        valign: 'middle'
+                    TextInput:
+                        id: username_input
+                        multiline: False
+                        hint_text: '字母/数字/点/下划线/连字符'
+                        on_text_validate: app.action_add_user()
+                    Label:
+                        text: '密码'
+                        size_hint_x: 0.22
+                        halign: 'left'
+                        text_size: self.size
+                        valign: 'middle'
+                    TextInput:
+                        id: password_input
+                        multiline: False
+                        password: True
+                        hint_text: '至少 6 位'
+
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(46)
+                    spacing: dp(8)
+                    Button:
+                        text: '添加用户'
+                        on_release: app.action_add_user()
+                    Button:
+                        text: '重置密码'
+                        on_release: app.action_reset_password()
+                    Button:
+                        text: '启用 / 禁用'
+                        on_release: app.action_toggle_enabled()
+                    Button:
+                        text: '删除用户'
+                        on_release: app.action_delete_user()
+
+                Label:
+                    id: users_hint
+                    size_hint_y: None
+                    height: dp(24)
+                    text: '点选下面的用户行来选中它'
+                    halign: 'left'
+                    valign: 'middle'
+                    text_size: self.size
+
+                ScrollView:
+                    GridLayout:
+                        id: user_grid
+                        cols: 1
+                        size_hint_y: None
+                        height: self.minimum_height
+                        spacing: dp(4)
+
+        # ============================ 服务配置 ============================
+        TabbedPanelItem:
+            text: '服务'
+            BoxLayout:
+                orientation: 'vertical'
+                padding: dp(14)
+                spacing: dp(10)
+
+                GridLayout:
+                    cols: 2
+                    size_hint_y: None
+                    height: dp(230)
+                    spacing: dp(8)
+                    row_default_height: dp(40)
+
+                    Label:
+                        text: '共享目录'
+                        size_hint_x: 0.22
+                        halign: 'left'
+                        text_size: self.size
+                        valign: 'middle'
+                    TextInput:
+                        id: dir_input
+                        multiline: False
+                        hint_text: '要共享出去的本地目录'
+
+                    Label:
+                        text: '端口'
+                        size_hint_x: 0.22
+                        halign: 'left'
+                        text_size: self.size
+                        valign: 'middle'
+                    TextInput:
+                        id: port_input
+                        multiline: False
+                        input_filter: 'int'
+                        hint_text: '2121'
+
+                    Label:
+                        text: '只读模式'
+                        size_hint_x: 0.22
+                        halign: 'left'
+                        text_size: self.size
+                        valign: 'middle'
+                    BoxLayout:
+                        orientation: 'horizontal'
+                        Switch:
+                            id: readonly_switch
+                            active: True
+                        Label:
+                            text: '打开=只能下载；关闭=可上传删改'
+                            halign: 'left'
+                            valign: 'middle'
+                            text_size: self.size
+
+                    Label:
+                        text: 'FTPS 加密'
+                        size_hint_x: 0.22
+                        halign: 'left'
+                        text_size: self.size
+                        valign: 'middle'
+                    BoxLayout:
+                        orientation: 'horizontal'
+                        spacing: dp(8)
+                        Switch:
+                            id: tls_switch
+                        Button:
+                            text: '生成自签证书'
+                            size_hint_x: None
+                            width: dp(130)
+                            on_release: app.action_generate_cert()
+
+                    Label:
+                        text: '自动停止'
+                        size_hint_x: 0.22
+                        halign: 'left'
+                        text_size: self.size
+                        valign: 'middle'
+                    BoxLayout:
+                        orientation: 'horizontal'
+                        spacing: dp(8)
+                        TextInput:
+                            id: autostop_input
+                            multiline: False
+                            input_filter: 'float'
+                            hint_text: '0'
+                        Label:
+                            text: '分钟后自动关闭（0=不自动关）'
+                            halign: 'left'
+                            valign: 'middle'
+                            text_size: self.size
+
+                Label:
+                    id: tls_status_label
+                    size_hint_y: None
+                    height: dp(24)
+                    text: ''
+                    halign: 'left'
+                    valign: 'middle'
+                    text_size: self.size
+
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(50)
+                    spacing: dp(8)
+                    Button:
+                        id: start_button
+                        text: '启动服务'
+                        on_release: app.action_start_service()
+                    Button:
+                        id: stop_button
+                        text: '停止服务'
+                        disabled: True
+                        on_release: app.action_stop_service()
+
+        # ============================== 日志 ==============================
+        TabbedPanelItem:
+            text: '日志'
+            BoxLayout:
+                orientation: 'vertical'
+                padding: dp(14)
+                spacing: dp(8)
+
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(44)
+                    spacing: dp(8)
+                    Button:
+                        text: '清空日志'
+                        on_release: app.action_clear_log()
+                    Button:
+                        text: '复制全部'
+                        on_release: app.action_copy_log()
+
+                ScrollView:
+                    id: log_scroll
+                    Label:
+                        id: log_label
+                        text: '（暂无日志）'
+                        size_hint_y: None
+                        height: self.texture_size[1]
+                        text_size: self.width, None
+                        halign: 'left'
+                        valign: 'top'
+                        padding: dp(6), dp(2)
+
+    Label:
+        id: status_bar
+        size_hint_y: None
+        height: dp(30)
+        text: '就绪'
+        halign: 'left'
+        valign: 'middle'
+        text_size: self.size
+        padding_x: dp(10)

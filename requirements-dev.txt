@@ -1,0 +1,3 @@
+# 开发期额外依赖（跑测试用）
+-r requirements.txt
+pytest>=8.0
